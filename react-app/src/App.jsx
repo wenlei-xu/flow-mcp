@@ -19,6 +19,29 @@ const META = {
   test: ["LIVE TEST", "测试页面", "默认由账号池自动选择空闲账号。"],
   settings: ["CONTROL", "系统设置", "队列、超时、结果链接和统一入口配置。"],
 };
+function isOmniModel(modelId) {
+  return String(modelId || "").toLowerCase().replaceAll("-", "_") === "omni_flash";
+}
+
+function durationOptionsForModel(modelId) {
+  return isOmniModel(modelId) ? [4, 6, 8, 10] : [];
+}
+
+function AspectDurationControl({ model, value, onChange }) {
+  if (!isOmniModel(model)) return <div className="sub">Veo：由 Flow 使用默认 8 秒</div>;
+  return (
+    <select id="testAspect" value={value} onChange={onChange}>
+      {durationOptionsForModel(model).flatMap((seconds) =>
+        ["9:16", "16:9"].map((ratio) => (
+          <option key={`${ratio}|${seconds}`} value={`${ratio}|${seconds}`}>
+            {ratio} · {seconds} 秒
+          </option>
+        )),
+      )}
+    </select>
+  );
+}
+
 const FALLBACK_MODELS = {
   image: [
     { id: "nano2", name: "Nano Banana 2" },
@@ -123,7 +146,7 @@ export default function App() {
     "一只奶油色小狗在温暖的客厅地垫上发现旧玩具碎片，随后好奇地看向镜头。",
   );
   const [model, setModel] = useState("veo_fast");
-  const [aspectDuration, setAspectDuration] = useState("9:16|6");
+  const [aspectDuration, setAspectDuration] = useState("9:16|8");
   const [projectId, setProjectId] = useState("");
   const [uploaded, setUploaded] = useState([]);
   const [submitting, setSubmitting] = useState(false);
@@ -325,7 +348,13 @@ export default function App() {
     [profiles, selectedProfile],
   );
   const modelOptions = models[kind] || [];
+  const selectedModel = modelOptions.find((item) => item.id === model);
+  const durationOptions = durationOptionsForModel(model);
   const [aspect, duration] = aspectDuration.split("|");
+  useEffect(() => {
+    if (kind !== "video" || !isOmniModel(model) || durationOptions.includes(Number(duration))) return;
+    setAspectDuration(`${aspect}|${durationOptions[0]}`);
+  }, [aspect, duration, durationOptions, kind, model]);
   const visibleLogs = useMemo(
     () =>
       logFilter === "all"
@@ -366,6 +395,8 @@ export default function App() {
     if (!prompt.trim()) return notify("请先填写提示词");
     if (kind === "video" && mode !== "t2v" && !uploaded.length)
       return notify("图生视频需要至少一张参考图");
+    if (kind === "video" && isOmniModel(model) && !durationOptions.includes(Number(duration)))
+      return notify(`${selectedModel?.name || model} 当前只支持 ${durationOptions.join("、")} 秒`);
     setSubmitting(true);
     setLastTest(null);
     try {
@@ -378,8 +409,10 @@ export default function App() {
           profile: selectedProfile === "auto" ? null : selectedProfile,
           project: selectedProfile === "auto" ? null : projectId || null,
           model,
+          requested_model: model,
+          model_label: selectedModel?.name || model,
           aspect,
-          duration: Number(duration),
+          ...(isOmniModel(model) ? { duration: Number(duration) } : {}),
           count: 1,
           mode: kind === "image" ? "t2v" : uploaded.length ? mode : "t2v",
           input_asset_ids: uploaded.map((item) => item.asset_id),
@@ -1233,20 +1266,16 @@ export default function App() {
                         </option>
                       ))}
                     </select>
+                     <div className="sub">实际提交：{model} · {selectedModel?.name || "未知模型"}</div>
                   </div>
-                  <div className="field">
-                    <label htmlFor="testAspect">画幅 / 时长</label>
-                    <select
-                      id="testAspect"
-                      value={aspectDuration}
-                      onChange={(event) =>
-                        setAspectDuration(event.target.value)
-                      }
-                    >
-                      <option value="9:16|6">9:16 · 6 秒</option>
-                      <option value="16:9|8">16:9 · 8 秒</option>
-                    </select>
-                  </div>
+                   <div className="field">
+                     <label htmlFor="testAspect">画幅 / 时长</label>
+                     <AspectDurationControl
+                       model={model}
+                       value={aspectDuration}
+                       onChange={(event) => setAspectDuration(event.target.value)}
+                     />
+                   </div>
                   {kind === "video" && (
                     <div className="field">
                       <label htmlFor="testMode">视频方式</label>

@@ -1121,6 +1121,8 @@ class GenerationRequest(BaseModel):
     profile: str | None = None
     project: str | None = None
     model: str | None = None
+    requested_model: str | None = None
+    model_label: str | None = None
     aspect: str = "9:16"
     duration: int | None = None
     count: int = Field(default=1, ge=1, le=4)
@@ -1149,6 +1151,22 @@ class ProfileUpdateRequest(BaseModel):
     enabled: bool | None = None
     image_concurrency: int | None = Field(default=None, ge=1, le=1)
     video_concurrency: int | None = Field(default=None, ge=1, le=1)
+
+
+def _veo_model_has_no_duration_control(model: str | None) -> bool:
+    if not model:
+        return False
+    normalized = model.strip().lower().replace("-", "_")
+    return normalized in {
+        "veo_lite",
+        "veo_fast",
+        "veo_quality",
+        "veo_3_1_lite",
+        "veo_3_1_fast",
+        "veo_3_1_quality",
+        "veo_lite_lp",
+        "veo_3_1_lite_lower_priority",
+    }
 
 
 def _request_hash(request: GenerationRequest) -> str:
@@ -3083,6 +3101,8 @@ async def _execute_generation(task_id: str, request: GenerationRequest) -> None:
 async def create_generation(request: GenerationRequest) -> dict[str, Any]:
     if request.input_asset_ids:
         request = request.model_copy(update={"reference_images": [*request.reference_images, *_resolve_input_asset_ids(request.input_asset_ids)]})
+    if request.kind == "video" and _veo_model_has_no_duration_control(request.model) and request.duration is not None:
+        request = request.model_copy(update={"duration": None})
     requested_profile = request.profile or "auto"
     if requested_profile != "auto":
         _validate_profile(requested_profile)
@@ -3107,6 +3127,8 @@ async def create_generation(request: GenerationRequest) -> dict[str, Any]:
         "id": task_id,
         "profile": requested_profile,
         "kind": request.kind,
+        "model": request.model,
+        "requested_model": request.model,
         "prompt": request.prompt,
         "project": request.project,
         "status": "queued",
