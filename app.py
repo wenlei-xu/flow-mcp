@@ -52,7 +52,6 @@ from gflow_cli.config import get_settings  # noqa: E402
 from gflow_cli.data.queries import list_errors, list_images, list_videos  # noqa: E402
 from gflow_cli.mcp.tools import (  # noqa: E402
     configure_rate_limiter,
-    gflow_auth_status,
     gflow_generate_image,
     gflow_generate_video,
     gflow_get_credits,
@@ -99,9 +98,6 @@ WORKER_LEASE_HEARTBEAT: asyncio.Task[Any] | None = None
 QUEUE_WORKER_ID = f"studio-{uuid.uuid4().hex[:10]}"
 SHUTTING_DOWN = False
 WORKER_LEASE_SECONDS = max(15, int(os.environ.get("GFLOW_STUDIO_WORKER_LEASE_SECONDS", "45")))
-AUTH_PROBE_TTL_SECONDS = 120
-AUTH_BACKOFF_BASE_SECONDS = 30
-AUTH_BACKOFF_MAX_SECONDS = 1800
 QUEUE_MAX_WORKERS = max(1, int(os.environ.get("GFLOW_STUDIO_QUEUE_WORKERS", "4")))
 IMAGE_MAX_WORKERS = max(1, int(os.environ.get("GFLOW_STUDIO_IMAGE_WORKERS", "8")))
 VIDEO_MAX_WORKERS = max(1, int(os.environ.get("GFLOW_STUDIO_VIDEO_WORKERS", "4")))
@@ -550,33 +546,20 @@ def _record_profile_health(name: str, result: dict[str, Any]) -> dict[str, Any]:
     return _profile_health(name)
 
 
-def _auth_probe_is_fresh(name: str) -> bool:
-    health = _profile_health(name)
-    if health["auth_state"] != "healthy" or not health["last_checked_at"]:
-        return False
-    try:
-        checked = datetime.fromisoformat(str(health["last_checked_at"]))
-        return (datetime.now(UTC) - checked).total_seconds() < AUTH_PROBE_TTL_SECONDS
-    except ValueError:
-        return False
-
-
 def _profile_is_pool_eligible(name: str) -> bool:
-    health = _profile_health(name)
-    if health["auth_state"] == "invalid":
-        return False
-    if health["auth_state"] == "unavailable":
-        try:
-            checked = datetime.fromisoformat(str(health["last_checked_at"]))
-            if (datetime.now(UTC) - checked).total_seconds() < AUTH_PROBE_TTL_SECONDS:
-                return False
-        except (TypeError, ValueError):
-            return False
+    """Keep cookie-bearing Profiles in the pool until a real task fails.
+
+    The former implementation ran the legacy labs.google session probe and
+    removed Profiles when that probe returned a false negative. The current
+    Flow protocol is validated by the actual generation request instead.
+    Health rows remain useful for diagnostics, but they are not a scheduler
+    admission gate.
+    """
     return True
 
 
 def _pool_profiles() -> list[profile_store.ProfileMeta]:
-    """Return real, enabled, cookie-bearing profiles not known to be invalid."""
+    """Return enabled, cookie-bearing Profiles eligible for real-task checks."""
     return [
         item
         for item in profile_store.list_profiles()
@@ -2384,8 +2367,12 @@ async def start_login(name: str) -> dict[str, Any]:
 @app.get("/api/profiles/{name}/status")
 async def profile_auth_status(name: str) -> dict[str, Any]:
     name = _validate_profile(name)
-    result = await gflow_auth_status(profile=name)
-    health = _record_profile_health(name, result)
+    health = _profile_health(name)
+    result = {
+        "status": "not_probed",
+        "profile": name,
+        "message": "旧版主动鉴权已停用；账号将在真实生成任务中验证。",
+    }
     return {"profile": name, "result": result, "health": health}
 
 
@@ -2567,8 +2554,8 @@ async def set_default_profile(name: str) -> dict[str, Any]:
     item = next((item for item in profile_store.list_profiles() if item.name == name), None)
     if item is None or not item.cookies_present:
         raise HTTPException(status_code=409, detail="只有已登录 Profile 才能设为默认账号")
-    if not _profile_setting(name)["enabled"] or _profile_health(name)["auth_state"] == "invalid":
-        raise HTTPException(status_code=409, detail="禁用或鉴权失效的 Profile 不能设为默认账号")
+    if not _profile_setting(name)["enabled"]:
+        raise HTTPException(status_code=409, detail="禁用的 Profile 不能设为默认账号")
     try:
         profile_store.set_default_profile(name)
     except (FileNotFoundError, ValueError) as exc:
@@ -2814,14 +2801,14 @@ async def _execute_generation(task_id: str, request: GenerationRequest) -> None:
     task = TASKS[task_id]
     task["status"] = "running"
     task["started_at"] = datetime.now(UTC).isoformat()
-    _set_task_progress(task, 5, "账号鉴权")
+    _set_task_progress(task, 5, "选择账号")
     try:
         if task.get("cancel_requested") or _task_cancel_requested(task_id):
             task["status"] = "cancelled"
             task["error"] = "任务在提交到 Flow 前已取消"
             return
         candidates = _execution_candidates(request.profile)
-        last_auth_error = "账号池中没有通过真实 Flow 鉴权的账号"
+        last_auth_error = "账号池中没有可用的已登录账号"
         generation_finished = False
         for profile in candidates:
             lock = _profile_lock(profile)
@@ -2834,23 +2821,9 @@ async def _execute_generation(task_id: str, request: GenerationRequest) -> None:
                 if not _profile_setting(profile)["enabled"]:
                     last_auth_error = f"Profile 已禁用：{profile}"
                     continue
-                if _auth_probe_is_fresh(profile):
-                    auth_result = {"status": "authenticated", "profile": profile, "cached": True}
-                else:
-                    try:
-                        auth_result = await gflow_auth_status(profile=profile)
-                    except Exception as exc:
-                        auth_result = {"status": "error", "error": {"status": 503, "retryable": True, "message": f"鉴权探测异常：{type(exc).__name__}"}}
-                    _record_profile_health(profile, auth_result)
-                if auth_result.get("status") != "authenticated":
-                    last_auth_error = f"Profile {profile} 鉴权失败：{_error_detail(auth_result)}"
-                    if (request.profile or "auto") != "auto":
-                        break
-                    continue
-
                 task["profile"] = profile
                 task["assigned_profile"] = profile
-                _set_task_progress(task, 15, "账号已确认")
+                _set_task_progress(task, 15, "账号已选择，提交真实任务")
                 try:
                     selected_project = await _resolve_project(profile, request.project)
                 except Exception as exc:

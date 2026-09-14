@@ -235,15 +235,13 @@ export default function App() {
   }, []);
   const refreshProfile = useCallback(async (name) => {
     if (!name || name === "auto") return;
-    const [status, credits] = await Promise.allSettled([
-      api(`/api/profiles/${encodeURIComponent(name)}/status`),
+    const credits = await Promise.allSettled([
       api(`/api/profiles/${encodeURIComponent(name)}/credits`),
     ]);
     setProfileInfo((current) => ({
       ...current,
       [name]: {
-        status: status.status === "fulfilled" ? status.value.result : null,
-        credits: credits.status === "fulfilled" ? credits.value.result : null,
+        credits: credits[0].status === "fulfilled" ? credits[0].value.result : null,
         checkedAt: new Date().toISOString(),
       },
     }));
@@ -549,10 +547,10 @@ export default function App() {
       notify(`删除失败：${error.message}`);
     }
   }
-  async function verify(name) {
+  async function refreshCredits(name) {
     await refreshProfile(name);
     await loadProfiles();
-    notify(`${name} 状态检查完成`);
+    notify(`${name} 额度已刷新；账号将在真实任务中验证`);
   }
   async function setDefault(name) {
     try {
@@ -802,14 +800,9 @@ export default function App() {
               profileInfo[item.name]?.credits?.credits ??
               profileInfo[item.name]?.credits?.balance ??
               profileInfo[item.name]?.credits?.remaining_credits;
-            const authLabel =
-              item.auth_state === "invalid"
-                ? "鉴权失效"
-                : item.auth_state === "unavailable"
-                  ? "鉴权暂不可用"
-                  : item.auth_state === "healthy"
-                    ? "鉴权正常"
-                    : "未验证";
+            const authLabel = item.cookies_present
+              ? "真实任务时验证"
+              : "等待登录";
             return (
               <div
                 className={`account-row ${!item.enabled ? "disabled-row" : ""}`}
@@ -842,14 +835,12 @@ export default function App() {
                 </div>
                 <div>
                   <span
-                    className={`status ${item.enabled ? (item.auth_state === "invalid" ? "fail" : item.cookies_present ? "done" : "run") : "fail"}`}
+                    className={`status ${item.enabled ? (item.cookies_present ? "done" : "run") : "fail"}`}
                   >
                     {item.enabled
-                      ? item.auth_state === "invalid"
-                        ? "已移出账号池"
-                        : item.cookies_present
-                          ? "账号池成员"
-                          : "待登录"
+                      ? item.cookies_present
+                        ? "账号池成员"
+                        : "待登录"
                       : "已禁用"}
                   </span>
                   <div className="sub">
@@ -865,7 +856,7 @@ export default function App() {
                   <div className="sub">账号并发 · 排队 {item.queued_tasks ?? 0}</div>
                 </div>
                 <div className="account-actions">
-                  <Button onClick={() => verify(item.name)}>验证</Button>
+                  <Button onClick={() => refreshCredits(item.name)}>刷新额度</Button>
                   <Button onClick={() => relogin(item.name)}>重登</Button>
                   <Button onClick={() => openProjects(item)}>项目池</Button>
                   <Button onClick={() => editProfile(item)}>编辑</Button>

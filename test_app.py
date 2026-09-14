@@ -68,9 +68,6 @@ class StudioSmokeTests(unittest.TestCase):
     def test_queue_idempotency_and_batch(self):
         meta = studio.profile_store.ProfileMeta("qa", Path("."), True, datetime.now(UTC), True, "qa@example.com")
 
-        async def auth(profile):
-            return {"status": "authenticated", "profile": profile}
-
         async def generate(**kwargs):
             return {"status": "succeeded", "files": []}
 
@@ -79,7 +76,6 @@ class StudioSmokeTests(unittest.TestCase):
 
         with patch.object(studio.profile_store, "list_profiles", return_value=[meta]), \
              patch.object(studio, "_is_loopback", return_value=True), \
-             patch.object(studio, "gflow_auth_status", side_effect=auth), \
              patch.object(studio, "gflow_generate_image", side_effect=generate), \
              patch.object(studio, "_resolve_project", side_effect=resolve), \
              TestClient(studio.app) as client:
@@ -93,6 +89,20 @@ class StudioSmokeTests(unittest.TestCase):
         self.assertEqual(first["id"], after_cache_restart["id"])
         self.assertEqual(batch.status_code, 202)
         self.assertEqual(batch.json()["count"], 2)
+
+    def test_legacy_auth_probe_failure_does_not_remove_cookie_profile_from_pool(self):
+        meta = studio.profile_store.ProfileMeta(
+            "legacy", Path("."), True, datetime.now(UTC), True, "legacy@example.com"
+        )
+        studio._record_profile_health(
+            "legacy",
+            {"status": "no_session", "error": {"status": 401, "message": "old verifier"}},
+        )
+
+        with patch.object(studio.profile_store, "list_profiles", return_value=[meta]):
+            pool = studio._pool_profiles()
+
+        self.assertEqual([item.name for item in pool], ["legacy"])
 
     def test_separate_worker_discovers_and_atomically_claims_api_task(self):
         task = {
