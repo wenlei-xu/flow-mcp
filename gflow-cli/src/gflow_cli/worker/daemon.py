@@ -1,0 +1,533 @@
+from __future__ import annotations
+
+import asyncio
+import os
+import re
+from pathlib import Path
+from typing import Any, Callable, cast
+
+import structlog
+
+from gflow_cli.api.client import FlowApiClient
+from gflow_cli.api.dto import GenerationCheckpoint, ProjectInfo
+from gflow_cli.api.image import GenerateImageRequest
+from gflow_cli.api.video import GenerateVideoRequest, VideoStarted
+from gflow_cli.config import get_settings
+from gflow_cli.data.models import OperationKind
+from gflow_cli.data.recorder import (
+    OperationRecorder,
+    escalate_asset_collision,
+    record_failed_operation_safe,
+)
+from gflow_cli.data.redaction import redact_error_detail
+from gflow_cli.data.repository import DataRepository
+from gflow_cli.data.store import DataStore
+from gflow_cli.errors import DataIntegrityError, DataStoreError, GFlowError
+from gflow_cli.observability import exception_message_hash
+from gflow_cli.paths import image_output_path
+from gflow_cli.storage import cloud_info_from_path
+from gflow_cli.worker import codec
+from gflow_cli.worker.queue import QueueRepository, QueueTask, mark_interrupted
+
+logger = structlog.get_logger()
+
+
+class FlowWorker:
+    def __init__(self, profile_name: str, db_path: str):
+        self.profile_name = profile_name
+        self.db_path = Path(db_path)
+        self.db = DataStore.open(self.db_path)
+        self.repo = QueueRepository(self.db)
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def close(self) -> None:
+        self.db.close()
+
+    async def start(self) -> None:
+        logger.info("Starting FlowWorker", profile_name=self.profile_name)
+        claimant = f"worker:{self.profile_name}:{os.getpid()}"
+        while not self._stop:
+            try:
+                # Atomic claim (C3/C4): pending -> processing in one
+                # BEGIN IMMEDIATE txn, so the MCP direct-exec path and this
+                # poll loop can never both take the same row. An invalid
+                # payload is failed inside the claim (no browser) and returns
+                # None here — same as an empty queue.
+                task = self.repo.claim_next_pending(self.profile_name, claimant)
+                if task:
+                    await self.process_task(task)
+                else:
+                    await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                # Cooperative cancellation: log, then re-raise so the framework
+                # (and the daemon lifespan awaiting this task) sees the worker
+                # has acknowledged the cancellation and is stopping.
+                logger.info("FlowWorker loop cancelled", profile_name=self.profile_name)
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "Error in FlowWorker loop", profile_name=self.profile_name, exc_info=exc
+                )
+                await asyncio.sleep(5)
+
+    async def process_task(
+        self,
+        task: QueueTask,
+        *,
+        progress_callback: Callable[[GenerationCheckpoint], None] | None = None,
+    ) -> None:
+        """Execute an ALREADY-CLAIMED (processing) task.
+
+        The pending -> processing transition belongs to the atomic claim
+        (``QueueRepository.claim_next_pending`` / ``claim_task``), never to
+        this method — that is what stops the MCP direct-exec path and the
+        daemon poll loop from both running the same row. ``task.decoded``
+        (when the caller went through a claim) carries the request validated
+        at claim time, so the payload mapping is not re-derived here.
+        """
+        # Per-task correlation rebind: the process-wide CLI binding would give
+        # every task's IncidentRecorder the same correlation id (colliding
+        # incident ids across tasks with one failure fingerprint). Tasks run
+        # strictly sequentially in this loop, so the cross-task-leakage concern
+        # that keeps binding out of concurrent async tasks (spec C6) does not
+        # apply; the sanitized task id makes bundles joinable to queue rows.
+        safe_task_id = re.sub(r"[^\w-]", "-", task.task_id)[:40] or "task"
+        structlog.contextvars.bind_contextvars(
+            correlation_id=f"wk-{safe_task_id}",
+            cli_command=f"worker {task.task_type}",
+        )
+        logger.info(
+            "Processing task",
+            task_id=task.task_id,
+            task_type=task.task_type,
+            profile_name=self.profile_name,
+        )
+
+        claimant = task.claimant or f"worker:{self.profile_name}:{os.getpid()}"
+        # Mutable holder so the observer sees the project id once it is resolved —
+        # an image task may auto-create its Flow project inside the client block.
+        checkpoint_project_id: list[str | None] = [task.payload.get("project_id")]
+
+        def save_checkpoint(
+            phase: str,
+            *,
+            may_have_spent: bool,
+            operation_id: str | None = None,
+            media_ids: tuple[str, ...] = (),
+            workflow_ids: tuple[str, ...] = (),
+        ) -> None:
+            # Observer-exception policy (C1 deferred decision): a checkpoint-persist
+            # failure MUST NOT abort a generation already in flight — that would
+            # waste a submit. Log and continue. Every write routes through
+            # update_checkpoint -> make_checkpoint_document (the redaction allow-list).
+            try:
+                self.repo.update_checkpoint(
+                    task.task_id,
+                    claimant=claimant,
+                    phase=phase,
+                    may_have_spent=may_have_spent,
+                    project_id=checkpoint_project_id[0],
+                    operation_id=operation_id,
+                    media_ids=media_ids,
+                    workflow_ids=workflow_ids,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "checkpoint_persist_failed",
+                    task_id=task.task_id,
+                    phase=phase,
+                    exc_info=exc,
+                )
+
+        def observe_checkpoint(cp: GenerationCheckpoint) -> None:
+            # Any emitted phase is at/after submit_attempted (C1 emits it right
+            # before the credit gesture), so may_have_spent is always True here.
+            save_checkpoint(
+                cp.phase,
+                may_have_spent=True,
+                operation_id=cp.operation_id,
+                media_ids=cp.media_ids,
+                workflow_ids=cp.workflow_ids,
+            )
+            if progress_callback is not None:
+                try:
+                    progress_callback(cp)
+                except Exception:
+                    # Progress is observational. A control-plane observer must
+                    # never turn a submitted generation into a failed one.
+                    logger.warning(
+                        "progress_callback_failed",
+                        task_id=task.task_id,
+                        phase=cp.phase,
+                        exc_info=True,
+                    )
+
+        # Pre-submit checkpoint: nothing spent yet. A crash/cancel before the
+        # observer fires classifies as a safe failure (queue.classify_interrupted).
+        save_checkpoint("claimed", may_have_spent=False)
+
+        settings = get_settings()
+        profile_dir = settings.profile_subdir(task.profile_name)
+        headless = task.payload.get("headless", settings.headless)
+        transport = task.payload.get("transport", settings.transport)
+        out_dir = (
+            Path(task.payload["out_dir"]) if "out_dir" in task.payload else settings.output_dir
+        )
+
+        # #341: bound before the try so the failure funnel below can persist a
+        # FAILED operation with whatever context was reached before the raise.
+        req: GenerateImageRequest | GenerateVideoRequest | None = None
+        recorder: OperationRecorder | None = None
+        started_media_ids: list[str] = []
+
+        try:
+            if task.task_type in ("t2i", "i2i"):
+                req = (
+                    cast("GenerateImageRequest", task.decoded.request)
+                    if task.decoded is not None
+                    else self._build_image_request(task.payload)
+                )
+                count = task.payload.get("count", 1)
+                project_id = task.payload.get("project_id")
+
+                recorder = OperationRecorder(
+                    DataRepository(self.db), prompt_mode=settings.history_prompts
+                )
+                try:
+                    async with FlowApiClient(
+                        profile_dir=profile_dir,
+                        headless=headless,
+                        transport=transport,
+                        out_dir=out_dir,
+                        # Reuse the cached settings: a bare Settings() in the client
+                        # would re-read .env files live per task and could disagree
+                        # with the task parameters derived from get_settings().
+                        settings=settings,
+                    ) as client:
+                        project_title = task.payload.get("project_title", "gflow-cli images")
+                        project_created = False
+                        if project_id:
+                            project_flow_id = project_id
+                            project = ProjectInfo(project_id=project_id, title=project_title)
+                        else:
+                            project = await client.create_project(title=project_title)
+                            project_flow_id = project.project_id
+                            project_created = True
+                        # Now that the project is resolved, the observer can persist
+                        # it (the credit-free video recovery key; harmless for images).
+                        checkpoint_project_id[0] = project_flow_id
+
+                        # Resolve @-mentions and expand --tool specs (shared helper).
+                        from gflow_cli.services.mentions import resolve_and_apply
+
+                        req = await resolve_and_apply(
+                            client,
+                            req,
+                            path="image",
+                            project_id=project_flow_id,
+                            tool_specs=tuple(task.payload.get("tool_specs", ())),
+                            quiet=True,
+                        )
+
+                        if count == 1:
+                            img = await client.generate_image(
+                                project_id=project_flow_id,
+                                req=req,
+                                on_checkpoint=observe_checkpoint,
+                            )
+                            images = [img]
+                        else:
+                            images = await client.generate_images_batch(
+                                project_id=project_flow_id,
+                                req=req,
+                                count=count,
+                                on_checkpoint=observe_checkpoint,
+                            )
+
+                        recorder.verify_media_attribution(
+                            profile_name=self.profile_name, images=images
+                        )
+
+                        flow_media_id = images[0].media_name if images else None
+
+                        output_file_val = task.payload.get("output_file")
+                        output_file = Path(output_file_val) if output_file_val else None
+
+                        saved_paths: list[Path] = []
+                        for i, img in enumerate(images, start=1):
+                            if output_file is not None:
+                                if len(images) == 1:
+                                    target = output_file
+                                else:
+                                    target = (
+                                        output_file.parent
+                                        / f"{output_file.stem}_{i}{output_file.suffix}"
+                                    )
+                                target.parent.mkdir(parents=True, exist_ok=True)
+                            else:
+                                target = image_output_path(
+                                    settings.output_dir, job_id=img.media_name, index=i
+                                )
+                            saved = await client.download_image(img, target)
+                            saved_paths.append(saved)
+
+                        try:
+                            recorder.record_generated_images(
+                                profile_name=self.profile_name,
+                                profile_dir=profile_dir,
+                                project=project,
+                                project_created=project_created,
+                                request=req,
+                                images=images,
+                                saved_paths=saved_paths,
+                                input_media_ids=(
+                                    [r.name for r in req.refs] if hasattr(req, "refs") else []
+                                ),
+                                operation_kind=task.task_type,
+                                cloud_storage_infos=[cloud_info_from_path(p) for p in saved_paths],
+                            )
+                        except DataStoreError as exc:
+                            # Collision escalation (issue #281/#282, consolidated):
+                            # delegates the route-scoped escalation decision to the
+                            # shared helper — a DataIntegrityError whose route is the
+                            # asset-collision constraint raises MediaAttributionError
+                            # (a more specific failure than the original exc); any
+                            # other DataIntegrityError, or a plain DataStoreError,
+                            # returns normally from the helper and falls through to
+                            # the bare `raise` below, re-raising the ORIGINAL
+                            # exception unchanged. Unlike cli_image.py/image_batch.py
+                            # there is no silent warn-and-continue here — the worker
+                            # always fails the task on any record_generated_images
+                            # exception (see escalate_asset_collision's docstring for
+                            # the route-scoping rationale, shared with the other two
+                            # call sites: cli_image._record_generated_images_safe /
+                            # image_batch._try_record_images).
+                            if isinstance(exc, DataIntegrityError):
+                                escalate_asset_collision(
+                                    exc, images=images, saved_paths=saved_paths
+                                )
+                            raise
+                except Exception as exc:
+                    logger.warning("Failed during image generation or recording", exc_info=exc)
+                    raise
+
+                self.repo.update_task_status(
+                    task.task_id,
+                    status="completed",
+                    flow_media_id=flow_media_id,
+                )
+                logger.info(
+                    "Task completed successfully", task_id=task.task_id, flow_media_id=flow_media_id
+                )
+
+            elif task.task_type in ("t2v", "i2v", "r2v"):
+                req = (
+                    cast("GenerateVideoRequest", task.decoded.request)
+                    if task.decoded is not None
+                    else self._build_video_request(task.payload)
+                )
+                project_id = task.payload.get("project_id")
+
+                recorder = OperationRecorder(
+                    DataRepository(self.db), prompt_mode=settings.history_prompts
+                )
+                # Non-optional alias for the closure below (`recorder` is
+                # declared Optional at method scope for the #341 failure funnel).
+                video_recorder = recorder
+                try:
+                    async with FlowApiClient(
+                        profile_dir=profile_dir,
+                        headless=headless,
+                        transport=transport,
+                        out_dir=out_dir,
+                        settings=settings,  # same rationale as the image path above
+                    ) as client:
+                        # Resolve @-mentions and expand --tool specs (shared helper).
+                        from gflow_cli.services.mentions import resolve_and_apply
+
+                        req = await resolve_and_apply(
+                            client,
+                            req,
+                            path="video",
+                            project_id=project_id,
+                            tool_specs=tuple(task.payload.get("tool_specs", ())),
+                            quiet=True,
+                        )
+
+                        def on_started(started: VideoStarted) -> None:
+                            started_media_ids.append(started.media_id)
+                            try:
+                                video_recorder.record_started_video(
+                                    profile_name=self.profile_name,
+                                    profile_dir=profile_dir,
+                                    request=req,
+                                    started=started,
+                                )
+                            except Exception as exc:
+                                logger.warning("Failed to record started video", exc_info=exc)
+
+                        result = await client.generate_video(
+                            req=req,
+                            project_id=project_id,
+                            out_dir=out_dir,
+                            download=True,
+                            on_started=on_started,
+                            on_checkpoint=observe_checkpoint,
+                        )
+                        flow_media_id = result.status.media_id
+
+                        output_file_val = task.payload.get("output_file")
+                        if output_file_val and result.local_path and result.local_path.exists():
+                            output_file = Path(output_file_val)
+                            output_file.parent.mkdir(parents=True, exist_ok=True)
+                            if result.local_path != output_file:
+                                result.local_path.replace(output_file)
+                                from dataclasses import replace
+
+                                result = replace(result, local_path=output_file)
+
+                    try:
+                        recorder.record_completed_video(
+                            profile_name=self.profile_name,
+                            _profile_dir=profile_dir,
+                            request=req,
+                            result=result,
+                            cloud_storage_info=(
+                                cloud_info_from_path(result.local_path)
+                                if result.local_path is not None
+                                else None
+                            ),
+                        )
+                    except Exception as exc:
+                        # Post-success recording must never flip a credit-spent
+                        # video to "failed" — warn and continue (cf. exit-code-16
+                        # data-store contract, on_started recorder safety).
+                        logger.warning("Failed to record completed video", exc_info=exc)
+
+                    if not result.status.succeeded:
+                        reasons = (
+                            ", ".join(result.status.failure_reasons)
+                            if result.status.failure_reasons
+                            else result.status.error_message or "Unknown reason"
+                        )
+                        raise GFlowError(f"Video generation failed: {reasons}")
+                except Exception as exc:
+                    logger.warning("Failed during video generation or recording", exc_info=exc)
+                    raise
+
+                self.repo.update_task_status(
+                    task.task_id,
+                    status="completed",
+                    flow_media_id=flow_media_id,
+                )
+                logger.info(
+                    "Task completed successfully", task_id=task.task_id, flow_media_id=flow_media_id
+                )
+            else:
+                raise ValueError(f"Unknown task type: {task.task_type}")
+
+        except asyncio.CancelledError:
+            # Cooperative cancellation: persist a truthful terminal state from the
+            # checkpoint reached (pre-submit -> failed; after submit_attempted ->
+            # indeterminate — a submitted task is NEVER silently failed and NEVER
+            # resubmitted), then re-raise so the poll loop / lifespan sees the ack.
+            #
+            # Same observer-exception policy as save_checkpoint above: a DB
+            # failure here (e.g. DataStoreError) must never replace the
+            # cancellation being handled — log and continue, `raise` stays
+            # outside the guard so the original CancelledError always wins.
+            try:
+                status = mark_interrupted(
+                    self.repo,
+                    task.task_id,
+                    self.repo.read_checkpoint(task.task_id),
+                    "cancelled",
+                )
+                logger.info("task_cancelled", task_id=task.task_id, status=status)
+            except Exception as exc:
+                logger.warning(
+                    "cancel_state_persist_failed",
+                    task_id=task.task_id,
+                    exc_info=exc,
+                )
+            raise
+
+        except Exception as exc:
+            logger.exception(
+                "Task execution failed",
+                task_id=task.task_id,
+                task_type=task.task_type,
+                exc_info=exc,
+            )
+
+            if isinstance(exc, GFlowError):
+                error_payload = dict(exc.to_problem_details())
+                from gflow_cli.errors import EXIT_CODE_MAP, is_retryable
+
+                exit_code = next(
+                    (code for cls, code in EXIT_CODE_MAP.items() if isinstance(exc, cls)),
+                    1,
+                )
+                error_payload["exit_code"] = exit_code
+                # §6.5: same shared retry classification as CLI --json / MCP.
+                error_payload["retryable"] = is_retryable(exc)
+                if "status" not in error_payload:
+                    error_payload["status"] = 500
+                # #341: the queue row persists to the same DB as the redacted
+                # operations row — scrub its detail with the same rules.
+                if "detail" in error_payload:
+                    error_payload["detail"] = redact_error_detail(str(error_payload["detail"]))
+            else:
+                error_payload = {
+                    "type": "https://gflow-cli.dev/errors/unknown",
+                    "title": "Unknown Error",
+                    "status": 500,
+                    # Hash, never the raw message — it may carry tokens (#341,
+                    # same privacy rule as operations.error_detail).
+                    "detail": f"sha256:{exception_message_hash(exc)}",
+                    "exit_code": 1,
+                }
+
+            # #341: mirror the queue's failure record into the operations table
+            # (single authoritative failure history). Skipped for unknown task
+            # types — they never reached a generation.
+            try:
+                op_kind: OperationKind | None = OperationKind(task.task_type)
+            except ValueError:
+                op_kind = None
+            if op_kind is not None:
+                # Prefer the mode the STARTED row was written with (the built
+                # request's mode) over task_type — they can disagree when the
+                # payload omits 'mode', and the STARTED-row lookup filters on it.
+                if isinstance(req, GenerateVideoRequest):
+                    op_kind = OperationKind(req.mode.value)
+                record_failed_operation_safe(
+                    recorder,
+                    logger=logger,
+                    profile_name=self.profile_name,
+                    profile_dir=profile_dir,
+                    command=f"worker {task.task_type}",
+                    mode=op_kind,
+                    exc=exc,
+                    request=req,
+                    flow_media_ids=started_media_ids,
+                )
+
+            self.repo.update_task_status(
+                task.task_id,
+                status="failed",
+                error=error_payload,
+            )
+
+    def _build_image_request(self, payload: dict[str, Any]) -> GenerateImageRequest:
+        # Delegates to the codec (Task C2) — the single mapping from a queue
+        # payload dict to GenerateImageRequest, shared with decode_payload's
+        # pre-flight validation so the two can never drift apart.
+        return codec.build_image_request(payload)
+
+    def _build_video_request(self, payload: dict[str, Any]) -> GenerateVideoRequest:
+        # Delegates to the codec (Task C2) — see _build_image_request.
+        return codec.build_video_request(payload)

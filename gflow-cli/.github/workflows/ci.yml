@@ -1,0 +1,339 @@
+name: CI
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+
+# Least-privilege default token for every job (OpenSSF Scorecard:
+# Token-Permissions). Jobs that need more elevate per-job below.
+permissions:
+  contents: read
+
+env:
+  # Suppress Node.js deprecation warnings and align with user request to use Node 22/remove noise.
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+  NODE_VERSION: '22'
+
+jobs:
+  # ── Security gate: runs first, on every push/PR, never skippable ──────────
+  secrets-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write  # gitleaks-action PR feedback comments
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0  # full history so gitleaks can diff against base
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Security gate: dependency CVE audit against locked deps ──────────────
+  deps-audit:
+    name: Dependency audit (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - name: Audit locked dependencies for known CVEs
+        # Fails the build on any known advisory. Accept later via: pip-audit --ignore-vuln <GHSA-id>
+        #
+        # `--all-extras` is REQUIRED, not tidiness. Without it `uv export` emits
+        # only the default dependency group, so everything reachable solely
+        # through an optional extra is never audited. That blind spot was real:
+        # aiohttp 3.13.5 and pyasn1 0.6.3 sat in uv.lock with published high
+        # advisories while this gate reported clean, because both arrive via the
+        # `gcs`/`s3` extras (gcsfs / s3fs / google-auth). GitHub's Dependabot
+        # alerts flagged them against uv.lock; this gate could not see them.
+        run: |
+          uv export --frozen --all-extras --format requirements-txt --no-emit-project > requirements-audit.txt
+          # pip-audit version pinned for a reproducible gate (uvx has no
+          # dependabot ecosystem — bump by hand when it drifts).
+          uvx pip-audit==2.10.1 -r requirements-audit.txt
+
+  # ── Security gate: static analysis of the workflows themselves ───────────
+  # Everything else in this file audits the Python we ship. Nothing audited the
+  # CI that ships it, and CI is a supply-chain surface in its own right: it
+  # holds a repository token, it publishes to PyPI, and its inputs (branch
+  # names, PR titles, fork content) are attacker-controllable text.
+  #
+  # zizmor is what turns that into a gate. It found real defects on its first
+  # run over this repo (#565): 12 checkouts persisting the job token into the
+  # workspace, and `${{ github.base_ref }}` interpolated straight into a
+  # governance-advisory shell script. Both are fixed; this job is what stops
+  # them coming back one copy-pasted step at a time.
+  workflow-audit:
+    name: Workflow audit (zizmor)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Audit workflows (zizmor)
+        # --offline: the online audits need a GH token and reach the network, so
+        #   they would make this gate non-deterministic and unrunnable on fork
+        #   PRs. Action freshness/pinning is already covered by Dependabot plus
+        #   Scorecard's Pinned-Dependencies check.
+        # --min-severity low: informational findings are advisory, not defects.
+        #   The one open today is `superfluous-actions` on
+        #   softprops/action-gh-release; rewriting the release publisher is not
+        #   a hardening change and is deliberately declined (docs/GITHUB.md).
+        # Version pinned for a reproducible gate — uvx has no Dependabot
+        # ecosystem, so bump it by hand (the pin is asserted by
+        # tests/scripts/test_workflow_hardening.py, which fails if the two drift).
+        run: uvx zizmor==1.29.0 --offline --min-severity low .github/workflows/
+
+  # ── Supply-chain gate: resolve WITHOUT the lockfile ───────────────────────
+  # Every other job installs via `uv sync`, which honours uv.lock. That means CI
+  # never exercises the version RANGES in pyproject.toml — the exact blind spot
+  # that let `mcp>=1.0.0` (unbounded) ship a broken MCP surface to every fresh
+  # `pip install gflow-cli` while CI stayed green: mcp 2.0.0 deleted
+  # `mcp.server.fastmcp`, which the server imports at module load.
+  #
+  # This job installs the way a USER does — from the declared ranges, newest
+  # compatible versions, no lockfile — and smoke-imports the surfaces that break
+  # first. It is what turns "a dependency published a major bump" from a user
+  # bug report into a CI failure.
+  resolve-drift:
+    name: Dependency resolution drift (no lockfile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Install from pyproject ranges (ignore uv.lock)
+        # --upgrade resolves to the newest versions the ranges allow, so a newly
+        # published major that our bounds do not exclude is caught here.
+        run: |
+          uv venv
+          uv pip install --upgrade .
+
+      - name: Smoke-import the MCP surface
+        # Import-time failures (deleted modules, moved symbols) surface here.
+        # Registration is a decorator side effect, so a successful import with a
+        # non-empty tool registry proves the whole surface still wires up.
+        run: |
+          uv run --no-sync python - <<'PY'
+          from gflow_cli.mcp.server import server, run_stdio, run_http, run_sse
+          from gflow_cli.mcp import prompts, resources, tools  # noqa: F401
+
+          n_tools = len(server._tool_manager._tools)
+          n_resources = len(server._resource_manager._resources)
+          n_prompts = len(server._prompt_manager._prompts)
+          print(f"tools={n_tools} resources={n_resources} prompts={n_prompts}")
+          assert n_tools, "no MCP tools registered"
+          assert n_resources, "no MCP resources registered"
+          assert n_prompts, "no MCP prompts registered"
+
+          import mcp.types as t
+          print("negotiable protocol ceiling:", t.LATEST_PROTOCOL_VERSION)
+          PY
+
+      - name: Smoke-run the CLI entry points
+        run: |
+          uv run --no-sync gflow --version
+          uv run --no-sync gflow --help
+          uv run --no-sync gflow serve --help
+
+      - name: Report the resolved versions
+        # Printed unconditionally so a green run still records what was resolved.
+        if: always()
+        run: uv pip list
+
+  # ── Main test matrix ──────────────────────────────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Set up Python
+        run: uv python install ${{ matrix.python-version }}
+
+      # --frozen: install from the committed uv.lock without re-resolving it.
+      # Plain `uv sync` REWRITES uv.lock in place, which would silently repair
+      # the exact version drift the hygiene gate below exists to catch.
+      - name: Install deps
+        run: uv sync --frozen --extra dev
+
+      # --no-sync for the same reason: `uv run` re-locks before running.
+      - name: Repo hygiene (no artefacts, no hardcoded paths, version lockstep)
+        run: uv run --no-sync python scripts/ci/check_repo_hygiene.py
+
+      - name: Documentation links
+        run: uv run python scripts/ci/check_doc_links.py
+
+      - name: Website docs PII guard (no private identifiers in the published mirror)
+        run: uv run python scripts/ci/check_website_docs_pii.py
+
+      - name: Website docs mirror in sync (regenerate-and-diff)
+        run: uv run python scripts/ci/generate_website_docs.py --check
+
+      - name: Council memory (every cited slug resolves, every file is cited)
+        run: uv run python scripts/ci/check_council_memory.py
+
+      - name: Lint
+        run: uv run ruff check src tests
+
+      - name: Format check
+        run: uv run ruff format --check src tests
+
+      - name: Type check
+        run: uv run pyright src
+
+      # The overlay-precondition tests (#593) drive the captured changelog markup in
+      # a real headless Chromium — a mock cannot tell you whether
+      # `[role='dialog']:has(a[href*='changelog']) button` resolves against Flow's
+      # actual DOM, only a real CSS engine can. They skip cleanly when the browser is
+      # absent, which would make them silently decorative in CI, so one job in the
+      # matrix installs it. No account, no network, no credits.
+      - name: Install Chromium (real-DOM fixture tests)
+        if: matrix.python-version == '3.13'
+        run: uv run playwright install chromium --with-deps
+
+      - name: Test (smoke only) + coverage
+        # e2e/live tests require a logged-in Chromium profile and may spend
+        # Flow credits. pyproject.toml excludes both markers by default; CI
+        # intentionally relies on that default smoke set.
+        run: uv run python -m pytest -q --cov=gflow_cli --cov-report=xml --junitxml=pytest-report.xml
+
+      - name: Test-count guard (a green build that ran nothing is not green)
+        # Floor well below the real count (~2900): catches collection collapse
+        # (bad marker/-k filter, broken conftest), never routine deletions.
+        run: uv run python scripts/ci/check_test_count.py pytest-report.xml 2000
+
+      # Upload coverage XML so the sonar job can consume it
+      - name: Upload coverage report
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          retention-days: 1
+
+  # ── Focused OS matrix: ProfileLease cross-process contract (Task D2) ──────
+  # Everything else in this file runs Ubuntu-only (the `test` job above).
+  # This job exists because ProfileLease's kernel lock is genuinely
+  # OS-specific (msvcrt.locking on Windows vs. fcntl.flock on POSIX) and D1's
+  # local Windows-only run left the POSIX fcntl branch reasoned-but-unexecuted
+  # (see .superpowers/sdd/task-D1-report.md). Runs ONLY the lease unit +
+  # subprocess tests, not the full suite.
+  profile-lease-matrix:
+    name: ProfileLease (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Install deps
+        run: uv sync --extra dev
+
+      - name: ProfileLease unit + subprocess tests
+        run: uv run python -m pytest tests/test_profile_lease.py tests/test_profile_lease_subprocess.py -q --junitxml=pytest-lease.xml
+
+      - name: Test-count guard (lease matrix ran its suite)
+        # Floor well below the ~29 executed per OS leg — catches collapse, not
+        # routine test consolidation.
+        run: uv run python scripts/ci/check_test_count.py pytest-lease.xml 10
+
+  # ── SonarCloud analysis ───────────────────────────────────────────────────
+  sonar:
+    name: SonarCloud analysis
+    runs-on: ubuntu-latest
+    needs: test   # wait for tests + coverage report
+    permissions:
+      contents: read
+      pull-requests: read  # PR-context analysis / decoration lookups
+    # Forked pull_request runs do not receive repository secrets, so SONAR_TOKEN
+    # is empty there and the scanner fails before analysis. Dependabot-triggered
+    # runs are the same case: GitHub serves them the separate Dependabot secrets
+    # namespace, so SONAR_TOKEN is also empty even though the branch is in-repo.
+    # Keep SonarCloud on trusted pushes/internal PRs where the token is available.
+    if: >
+      always() &&
+      github.actor != 'dependabot[bot]' &&
+      (
+        github.event_name != 'pull_request' ||
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0  # shallow clones break blame / new-code detection
+
+      - name: Download coverage report
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: coverage-xml
+        continue-on-error: true  # graceful if coverage upload was skipped
+
+      # SonarCloud is a third-party service; it does have outages (seen live
+      # 2026-07-16, ~504s across its whole API including the unauthenticated
+      # /api/system/status endpoint). Reassessed fresh on every run — no manual
+      # flag to remember to flip back once it recovers. A skip here still lets
+      # the job COMPLETE (green), it just doesn't run the scan step; local
+      # coverage during an outage comes from the shared SonarQube instance
+      # (scripts/dev/sonar-local-scan.sh) — see docs/GITHUB.md § SonarCloud
+      # outage handling.
+      - name: Check SonarCloud availability
+        id: sonarcloud_health
+        run: |
+          if curl -sf -m 10 "https://sonarcloud.io/api/system/status" | grep -q '"status":"UP"'; then
+            echo "up=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "up=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::SonarCloud is unreachable or degraded — skipping the scan for this run (not a code quality failure). Verify locally with scripts/dev/sonar-local-scan.sh before merging if this persists, and re-run this job once SonarCloud recovers."
+          fi
+
+      - name: SonarCloud scan
+        if: steps.sonarcloud_health.outputs.up == 'true'
+        # sonarcloud-github-action is ARCHIVED upstream (dependabot never bumps
+        # archived actions, so its pin would rot silently); sonarqube-scan-action
+        # is SonarSource's maintained successor and serves SonarCloud when
+        # SONAR_HOST_URL points at it.
+        uses: SonarSource/sonarqube-scan-action@22918119ff8e1ca75a623e15c8296b6ea4fbe28f # v8.2.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # PR decoration
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}    # set in repo → Settings → Secrets
+          SONAR_HOST_URL: https://sonarcloud.io

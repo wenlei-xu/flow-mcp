@@ -1,0 +1,1392 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, TypedDict, cast
+
+if TYPE_CHECKING:
+    from gflow_cli.diagnostics import IncidentRef
+
+__all__ = [
+    "CONTENT_SAFETY_REASONS",
+    "EXIT_CODE_MAP",
+    "RETRYABLE_ERRORS",
+    "AisandboxAuthError",
+    "AuthExpiredError",
+    "AuthLoginTimeoutError",
+    "AuthMissingError",
+    "BatchIntegrityError",
+    "BatchPartialError",
+    "BrowserEngineUnavailableError",
+    "ChainManifestError",
+    "ChainPartialError",
+    "ConfigurationError",
+    "ContentPolicyError",
+    "DataIntegrityError",
+    "DataMigrationError",
+    "DataStoreError",
+    "ExtendUnavailableError",
+    "FlowAgentUiError",
+    "FlowApiError",
+    "FlowAppError",
+    "FlowAccountChooserError",
+    "FlowHostMigratedError",
+    "FrameExtractionError",
+    "GFlowError",
+    "MediaAttributionError",
+    "MediaUploadRejectedError",
+    "ReferenceNotFoundError",
+    "MentionIndexUnavailableError",
+    "ModelModeIncompatibilityError",
+    "NetworkError",
+    "OwnerEvidence",
+    "ProblemDetails",
+    "QueueSchemaError",
+    "RateLimitError",
+    "SceneConcatError",
+    "SecurityError",
+    "SyncPartialError",
+    "TransportTimeoutError",
+    "UiModeUnavailableError",
+    "UiSelectorDriftError",
+    "UpscaleUnavailableError",
+    "VideoModelSelectionError",
+    "WafRejectionError",
+    "WireFormatError",
+    "classify_content_safety",
+    "is_retryable",
+]
+
+
+class ProblemDetails(TypedDict, total=False):
+    """RFC 9457 Problem Details JSON shape (https://datatracker.ietf.org/doc/html/rfc9457).
+    Two gflow extensions: `remediation_hint` and `route`."""
+
+    type: str  # required
+    title: str  # required
+    status: int  # optional — only the literal HTTP status of the failed call
+    detail: str  # optional
+    instance: str  # optional — `gflow:error:<correlation_id>`
+    remediation_hint: str  # gflow extension
+    route: str  # gflow extension — sanitized route name, NOT full URL
+    incident: dict[str, str]  # gflow extension — remote-safe {id, capture_status} ONLY
+
+
+class GFlowError(Exception):
+    """Base class for all gflow domain errors. Library-wide root.
+
+    Field shape: RFC 9457 Problem Details. Class-level (`problem_type`,
+    `title`, `_default_remediation`) define stable identity per class.
+    Instance-level (`detail`, `status`, `instance`, `remediation_hint`,
+    `route`) populated per raise.
+
+    `instance` is `gflow:error:<correlation_id>` (per-occurrence ID), NOT
+    the failed route URL — RFC 9457 §3.5 says `instance` identifies the
+    occurrence, not the endpoint. Route name lives in the `route` extension.
+    """
+
+    problem_type: str = "about:blank"
+    title: str = "Error"
+    _default_remediation: str = ""
+    #: Set post-raise by the incident capture boundary (diagnostics design).
+    #: ``to_problem_details()`` exposes only the remote-safe {id, capture_status}
+    #: projection; the local path/artifacts stay CLI-local (S21).
+    incident_ref: IncidentRef | None = None
+
+    def __init__(
+        self,
+        detail: str = "",
+        *,
+        status: int | None = None,
+        instance: str | None = None,
+        route: str = "",
+        remediation_hint: str | None = None,
+    ) -> None:
+        message = self.title if not detail else f"{self.title}: {detail}"
+        super().__init__(message)
+        self.detail = detail
+        self.status = status
+        self.instance = instance or ""
+        self.route = route
+        self.remediation_hint = (
+            remediation_hint if remediation_hint is not None else self._default_remediation
+        )
+
+    def to_problem_details(self) -> ProblemDetails:
+        out: ProblemDetails = {
+            "type": self.problem_type,
+            "title": self.title,
+        }
+        if self.status is not None:
+            out["status"] = self.status
+        if self.detail:
+            out["detail"] = self.detail
+        if self.instance:
+            out["instance"] = self.instance
+        if self.remediation_hint:
+            out["remediation_hint"] = self.remediation_hint
+        if self.route:
+            out["route"] = self.route
+        if self.incident_ref is not None:
+            out["incident"] = {
+                "id": self.incident_ref.id,
+                "capture_status": self.incident_ref.capture_status,
+            }
+        return out
+
+
+class FlowApiError(GFlowError):
+    """Parent of all API-related errors. Retained as a named parent class so
+    `except FlowApiError` continues to catch typed subclasses below.
+
+    Constructor accepts BOTH the legacy 3-arg form (Phase 3 callers) AND
+    the new GFlowError-style kwargs.
+
+    Legacy form: ``FlowApiError(status: int, body: str, *, route: str = "")``
+    The ``body`` argument MUST be pre-redacted via ``_redact_for_log`` before
+    construction (mandate per security review). It is truncated to 200
+    chars and incorporated into ``detail``.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/api-error"
+    title = "Flow API error"
+    _default_remediation = (
+        "Check request parameters and network connection, then retry the API call."
+    )
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # `bool` is a subclass of `int`, so `isinstance(True, int)` is True.
+        # Exclude bools explicitly so an accidental FlowApiError(True, ...) takes
+        # the new-style path (and surfaces as a TypeError downstream) instead of
+        # silently being treated as legacy with status=1.
+        if args and isinstance(args[0], int) and not isinstance(args[0], bool):
+            status = args[0]
+            body = args[1] if len(args) > 1 else ""
+            route_kw = kwargs.pop("route", "")
+            super().__init__(
+                f"HTTP {status}: {body[:200]}",
+                status=status,
+                instance=kwargs.pop("instance", None),
+                route=route_kw,
+                remediation_hint=kwargs.pop("remediation_hint", None),
+            )
+            self.body = body
+        else:
+            super().__init__(*args, **kwargs)
+            self.body = ""
+
+
+class AuthExpiredError(FlowApiError):
+    problem_type = "https://gflow-cli.dev/errors/auth-expired"
+    title = "Authentication expired"
+    _default_remediation = "Run `gflow auth login --profile <name>` to refresh the session."
+
+
+class AisandboxAuthError(AuthExpiredError):
+    """aisandbox-pa REST returned 401 even after a fresh SAPISIDHASH.
+
+    Distinct from the generic AuthExpiredError so callers (and the scene
+    feature) can catch the aisandbox-specific auth failure, while still
+    mapping to exit code 3 via the EXIT_CODE_MAP isinstance walk (no own
+    entry needed — it inherits AuthExpiredError's code).
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/aisandbox-auth"
+    title = "aisandbox-pa authentication failed"
+    _default_remediation = (
+        "SAPISID cookie missing, expired, or unreadable. "
+        "Re-run `gflow auth login --profile <name>` and retry."
+    )
+
+
+CONTENT_SAFETY_REASONS: frozenset[str] = frozenset(
+    {
+        "PUBLIC_ERROR_UNSAFE_GENERATION",
+        "PUBLIC_ERROR_UNSAFE_CONTENT",
+        "PUBLIC_ERROR_UNSAFE_FACE",
+        "PUBLIC_ERROR_UNSAFE_IDENTITY",
+    }
+)
+"""Flow's content-safety ``details[].reason`` values on an HTTP 400.
+
+Lives here, next to :class:`ContentPolicyError` whose docstring documents the
+wire shape, because ``errors`` is a leaf module: ``api.client``,
+``api.transports.*`` and ``diagnostics`` can all import it, and none of them can
+import each other (``client`` imports ``transports``; ``diagnostics`` must stay
+leaf-level because ``FlowApiClient`` owns the ``IncidentRecorder``). Before #528
+this set was maintained in three places and the transports had no copy at all.
+"""
+
+
+def classify_content_safety(body: object) -> str | None:
+    """Return Flow's content-safety ``reason``, or ``None`` if the body has none.
+
+    Accepts either the raw response text (what ``api.client`` holds) or an
+    already-parsed dict (what the ``ui_automation`` response listener stores),
+    so both callers share one implementation.
+
+    Flow's HTTP 400 error shape::
+
+        {"error": {"code": 400, "message": "...", "status": "INVALID_ARGUMENT",
+                   "details": [{"reason": "PUBLIC_ERROR_UNSAFE_GENERATION"}]}}
+    """
+    parsed: object = body
+    if isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    if not isinstance(parsed, dict):
+        return None
+    error_obj = cast("dict[str, Any]", parsed).get("error")
+    if not isinstance(error_obj, dict):
+        return None
+    details = cast("dict[str, Any]", error_obj).get("details")
+    if not isinstance(details, list):
+        return None
+    for item in cast("list[Any]", details):
+        if isinstance(item, dict):
+            reason = cast("dict[str, Any]", item).get("reason", "")
+            if reason in CONTENT_SAFETY_REASONS:
+                return cast("str", reason)
+    return None
+
+
+class RateLimitError(FlowApiError):
+    problem_type = "https://gflow-cli.dev/errors/rate-limit"
+    title = "Rate limit or quota hit"
+    _default_remediation = (
+        "Daily or per-minute model quota reached; retry with a different model or "
+        "wait for quota reset"
+    )
+
+    def __init__(
+        self,
+        detail: str = "",
+        *,
+        status: int | None = None,
+        instance: str | None = None,
+        route: str = "",
+        remediation_hint: str | None = None,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(
+            detail,
+            status=status,
+            instance=instance,
+            route=route,
+            remediation_hint=remediation_hint,
+        )
+        self.retry_after = retry_after
+
+
+class ContentPolicyError(FlowApiError):
+    """Flow rejected the request under its content policy.
+
+    Two known raise sites:
+
+    1. **HTTP 200 with empty ``media[]``** — the classic content-safety path
+       (``_common.py``). ``status`` is omitted from ``to_problem_details()``
+       per RFC 9457 — 200 conflates with success. The literal upstream
+       status (200) is recorded only via the ``error_raised`` log event as
+       an ``upstream_status`` extension (see observability.py).
+
+    2. **HTTP 400 with a content-safety reason** — ``_raise_for_non_retryable``
+       in ``client.py``. The body carries ``details[].reason`` =
+       ``PUBLIC_ERROR_UNSAFE_GENERATION`` (or ``_CONTENT``,
+       ``_FACE``, ``_IDENTITY``). ``status=400`` is set on the exception
+       but stripped from ``to_problem_details()`` per the same RFC 9457
+       contract.
+
+    Enforcement is at the class level (overrides ``to_problem_details``) —
+    relying on callers to omit ``status=`` would silently break the RFC 9457
+    contract the first time someone added it for symmetry with other error
+    classes.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/content-policy"
+    title = "Content policy rejection"
+    _default_remediation = "Reduce prompt text or describe <= 1 person per scene"
+
+    def to_problem_details(self) -> ProblemDetails:
+        pd = super().to_problem_details()
+        # RFC 9457 contract: an error must not carry a 2xx status.
+        pd.pop("status", None)
+        return pd
+
+
+class NetworkError(FlowApiError):
+    problem_type = "https://gflow-cli.dev/errors/network"
+    title = "Network failure persisted across retries"
+    _default_remediation = "Check connectivity and try again."
+
+
+class WireFormatError(FlowApiError):
+    """Carries discovery fields so ``grep error_class=WireFormatError`` in
+    structured logs reveals what was unexpected, enabling new error class
+    proposals. Discovery payload set at raise site via the ``discovery=`` kwarg."""
+
+    problem_type = "https://gflow-cli.dev/errors/wire-format"
+    title = "Unexpected response shape from Flow"
+    _default_remediation = (
+        "Check request payload parameters or retry with a simpler prompt text. "
+        "File a bug at https://github.com/ffroliva/gflow-cli/issues with the "
+        "discovery payload above."
+    )
+
+    def __init__(
+        self,
+        detail: str = "",
+        *,
+        status: int | None = None,
+        instance: str | None = None,
+        route: str = "",
+        remediation_hint: str | None = None,
+        discovery: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            detail,
+            status=status,
+            instance=instance,
+            route=route,
+            remediation_hint=remediation_hint,
+        )
+        self.discovery = discovery or {}
+
+
+class SceneConcatError(FlowApiError):
+    """Raised when Flow's server-side scene concatenation job FAILS.
+
+    Distinct from a poll timeout (which raises ``TransportTimeoutError``, exit 9):
+    this is a terminal ``MEDIA_GENERATION_STATUS_FAILED`` / unexpected status from
+    ``runVideoFxCheckConcatenationStatus`` (or an undecodable / non-MP4 payload).
+    The error detail is built from the ``status`` ONLY — never the ~20MB inline
+    ``encodedVideo``.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/scene-concat"
+    title = "Scene concatenation failed"
+    _default_remediation = "Ensure video clip dimensions and codecs match before concatenation"
+
+
+class TransportTimeoutError(GFlowError):
+    """Raised when a transport strategy hangs > 30s on a single API call."""
+
+    problem_type = "https://gflow-cli.dev/errors/transport-timeout"
+    title = "Transport strategy timed out"
+    _default_remediation = (
+        "A single API call exceeded the 30 s deadline. "
+        "Check connectivity or reduce request complexity."
+    )
+
+
+class WafRejectionError(GFlowError):
+    """Raised on HTTP 403 from Flow API; likely WAF / browser-fingerprint mismatch."""
+
+    problem_type = "https://gflow-cli.dev/errors/waf-rejection"
+    title = "WAF rejection (HTTP 403)"
+    _default_remediation = (
+        "Flow returned 403; the request was blocked by a WAF or fingerprint check. "
+        "Re-authenticate or rotate the transport profile."
+    )
+
+
+class ConfigurationError(GFlowError):
+    """Raised when configuration is invalid (e.g. unknown transport name)."""
+
+    problem_type = "https://gflow-cli.dev/errors/configuration"
+    title = "Configuration error"
+    _default_remediation = (
+        "Check that the transport name is registered via make_transport(). "
+        "Run `gflow config list-transports` to see available strategies."
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerEvidence:
+    """Private diagnostic evidence about the recorded lease owner (§6.4 of the
+    incident-diagnostics design). Identities are per-command HMACs — never the
+    raw profile name or owner token. The kernel lock is authoritative; this
+    metadata can be stale and never authorizes reclaim, unlink, or PID kill."""
+
+    pid: int
+    process_start_time: float
+    profile_identity: str
+    owner_token_identity: str
+
+
+class ProfileLockedError(ConfigurationError):
+    """Raised when the profile directory is held by another process.
+
+    Two known causes, each raise site supplying its own remediation: a running
+    ``gflow serve`` daemon (browser_manager), or another Chrome — typically a
+    stale browser leaked by a crashed prior run — holding the dir at
+    persistent-context launch (issue #293).
+
+    ``owner_evidence`` is a PRIVATE typed attribute set by ``ProfileLease``
+    contention paths for the incident recorder and local human formatter only.
+    It is deliberately excluded from ``to_problem_details()`` and therefore
+    from every MCP/HTTP/worker/structured-log surface.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/profile-locked"
+    title = "Profile locked"
+    owner_evidence: OwnerEvidence | None = None
+    _default_remediation = (
+        "A live process holds this profile: a gflow command, a `gflow serve` "
+        "daemon, or a Chrome/python process using the profile dir. Close it and "
+        "retry, or use a different profile name. If nothing is running, the "
+        "kernel lock is already released — a leftover lock file never blocks "
+        "acquisition, so just retry."
+    )
+
+
+class ProfileEngineDowngradeError(ConfigurationError):
+    """Raised when a persisted profile was last written by a newer Chromium
+    than the engine about to open it (#477).
+
+    Chromium's downgrade cleanup on open can leave the newer store — session
+    cookies included — unreadable, surfacing later as a mystery logout. Like
+    :class:`ProfileLockedError`, this is a profile-state precondition that
+    fails closed before any browser starts; it inherits ConfigurationError's
+    exit code 11 (no own EXIT_CODE_MAP entry). The raise site supplies the
+    message naming both versions; login is deliberately unguarded — it re-mints
+    the session and rewrites the profile, so it is the recovery path.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/profile-engine-downgrade"
+    title = "Profile was written by a newer Chromium"
+    _default_remediation = (
+        "Upgrade so the bundled Chromium is at least the profile's major version "
+        "(e.g. `uv tool upgrade gflow-cli`, then `playwright install chromium`). "
+        "If the profile was captured with `--browser chrome`, reinstall Google "
+        "Chrome in its default location instead — the chrome channel then opens "
+        "the profile and this check does not apply. Or re-create the profile "
+        "with `gflow auth login`."
+    )
+
+
+class BrowserEngineUnavailableError(ConfigurationError):
+    """Raised when GFLOW_CLI_BROWSER_ENGINE selects an engine that is unavailable.
+
+    Two causes: the optional ``patchright`` package is not installed, or its
+    browser driver is missing. Caught at the engine-resolver seam and re-raised
+    here (never a raw ``ImportError``, which would be SHA-hashed to a generic
+    exit 1). Distinct exit code 24 (not ConfigurationError's 11) so scripted
+    callers can branch on "install the engine" versus a generic config mistake.
+    The remediation hint differs per cause and is supplied at the raise site.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/browser-engine-unavailable"
+    title = "Selected browser engine is unavailable"
+    _default_remediation = (
+        "The selected browser engine is unavailable. Install it with "
+        "`pip install patchright`, or unset GFLOW_CLI_BROWSER_ENGINE to use the "
+        "default playwright engine."
+    )
+
+
+class ModelModeIncompatibilityError(ConfigurationError):
+    """Raised when the chosen video model is incompatible with the requested
+    generation mode (issue #125).
+
+    One case remains: ``omni-flash`` for **chains**. Single-clip start-frame
+    i2v was wire-verified 2026-08-03 and the end frame on 2026-09-02, but N
+    seeded links back-to-back has not been, so chains stay on the Veo 3.1
+    family.
+
+    History: omni-flash was excluded from i2v entirely after a 2026-05-30
+    capture showed Flow silently dropping the frame refs at submit and billing
+    the run as text-to-video. The start-frame path was re-verified on the wire
+    and re-enabled (#125); the END frame followed once Flow shipped first+last
+    for Omni 1.1 Flash and two accounts reproduced the
+    ``StartAndEndImage`` route at zero credits (#626). What guards the i2v path
+    now is a post-submit route check in the transport, not this error — it
+    validates the route Flow actually used rather than a static capability
+    table that can go stale in either direction.
+
+    Raised pre-submit at the CLI boundary, so it never spends a credit.
+
+    Distinct exit code 17 (not Click's exit 2, not generic exit 1) so
+    scripted callers can branch on "I picked an incompatible
+    model/mode" without parsing stderr.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/model-mode-incompatibility"
+    title = "Model is incompatible with the requested generation mode"
+    _default_remediation = (
+        "The selected video model does not support this generation mode. "
+        "omni-flash is not accepted for `gflow video chain`: chains stay on a "
+        "Veo 3.1 model (veo-lite / veo-fast / veo-quality / veo-lite-lp). "
+        "Single-clip i2v — including --end-frame — is unaffected. "
+        "See issues #125 and #626."
+    )
+
+
+class VideoModelSelectionError(ConfigurationError):
+    """Raised when the requested video model could not be selected in Flow's UI
+    for an i2v generation (issue #125).
+
+    The model picker option was not found (e.g. a selector drift / render race).
+    For i2v this is FATAL rather than a silent fallback: leaving Flow on its
+    default model (``omni-flash``) would drop the start/end frames and route to
+    T2V, charging a credit for a text-only video. Raised pre-submit by the
+    transport, so no credit is spent.
+
+    Distinct exit code 18 so scripted callers can branch on "the model UI failed"
+    (a retryable transport/selector issue) versus exit 17 "I picked an
+    incompatible model" (a request mistake).
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/video-model-selection"
+    title = "Could not select the requested video model"
+    _default_remediation = (
+        "gflow could not select the requested model in Flow's editor (the model "
+        "picker option was not found). This is usually transient — retry the "
+        "command. If it persists, Flow's model-picker UI may have changed; please "
+        "report it referencing issue #125."
+    )
+
+
+class UpscaleUnavailableError(GFlowError):
+    """Raised when an image upscale target resolution is unavailable for the account
+    (issue #171).
+
+    The canonical case: a non-Ultra (e.g. Pro) account requests ``--scale 4k``.
+    Flow's ``upsampleImage`` endpoint returns HTTP 403 for the tier gate, which is
+    indistinguishable on the wire from a WAF/fingerprint 403. The transport
+    disambiguates by context (the request was a 4K upscale, the session is valid,
+    reCAPTCHA was accepted) and raises THIS error rather than ``WafRejectionError``.
+
+    Distinct exit code 22 (not WAF's 10) so scripted callers can branch on
+    "upgrade your subscription" versus "the request was blocked / rotate profile".
+    The caller MUST NOT auto-retry a tier 403 — retrying only inflates per-profile
+    WAF heat without ever succeeding.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/upscale-unavailable"
+    title = "Image upscale unavailable for this account"
+    _default_remediation = (
+        "This upscale resolution is not available on your account. 4K upscaling "
+        "requires a Flow Ultra subscription — use --scale 2k, or upgrade your plan. "
+        "If you just upgraded, re-run `gflow auth login --profile <name>` to refresh "
+        "the session."
+    )
+
+
+class ExtendUnavailableError(GFlowError):
+    """Raised when no Veo *extend* model is orderable for this account/aspect.
+
+    Flow's extend family is tier-gated: `veo_3_1_extend_*_ultra` is
+    ``SERVICE_TIER_ADVANCED``-only, the un-suffixed variants serve
+    INTERMEDIATE/ENTRY, and every entry carries a per-tier ``creditMapping`` whose
+    cost reads ``"UNAVAILABLE"`` where the account cannot order it. There is also
+    no SQUARE key in either family. So "which model?" has no static answer — it is
+    resolved per run from ``flow.projectInitialData``.
+
+    This error means that resolution found nothing: an unsupported aspect, a
+    cohort without the extend capability, or a tier whose every candidate reads
+    ``UNAVAILABLE``. Raising beats falling back to a hardcoded key — a pinned key
+    that the account cannot order produces a 403 on every attempt, which is the
+    exact failure mode of the third-party CLI that prompted this feature.
+
+    Distinct exit code 35 (not WAF's 10) for the same reason
+    :class:`UpscaleUnavailableError` has 22: both are tier gates that look like a
+    WAF 403 on the wire, and a caller told "you were blocked, cool down 30 minutes"
+    would wait for a condition that never changes. The caller MUST NOT auto-retry.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/extend-unavailable"
+    title = "Video extend unavailable for this account"
+    _default_remediation = (
+        "No extend model is available for this account and aspect ratio. Extend "
+        "supports 16:9 and 9:16 only (there is no square variant). If you are on a "
+        "lower tier, the faster extend models may be gated — check `gflow models`. "
+        "If you just upgraded, re-run `gflow auth login --profile <name>` to refresh "
+        "the session."
+    )
+
+
+class UiSelectorDriftError(GFlowError):
+    """Raised when a UI-automation selector cascade cannot reach the control it needs.
+
+    Two shapes, and the second is easy to forget: the selector **finds nothing**, or it
+    finds the element and the element **will not take the interaction** — occluded,
+    disabled, or never holding still (#593's blocked overlay, #776's click that expired
+    while the control read visible and enabled). Both mean the same thing to a caller —
+    gflow cannot drive this control — which is why they share an exit code, and why the
+    ``detail`` has to say which one happened.
+
+    Indicates that Flow's frontend has changed in a way that invalidates one
+    of the selector probes (mode-switch trigger, mode tab, sub-mode tab, etc.),
+    or that something on the page is in the way.
+    The ``detail`` names the probe label and includes the debug screenshot or
+    diagnostics JSON path when one was captured.
+
+    This is a hard failure — gflow cannot safely proceed without the control —
+    but it is *diagnosed*, not opaque: the user gets the probe name and the
+    captured artifact for inspection.  Exit code 23 lets scripted callers branch on
+    "the UI changed and needs a selector update" versus generic error (1).
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/ui-selector-drift"
+    title = "Flow UI selector drift"
+    _default_remediation = (
+        "A Flow editor UI element could not be located — Google may have updated "
+        "their frontend. Check for a newer gflow-cli release, then file a bug at "
+        "https://github.com/ffroliva/gflow-cli/issues referencing the probe name "
+        "and attaching the diagnostics JSON and/or debug screenshot referenced in "
+        "this message, plus the incident bundle's report.md when one was written "
+        "(review artifacts before sharing — screenshots may show your account "
+        "name/avatar; do NOT include tokens or signed URLs)."
+    )
+
+
+class InsufficientCreditsError(GFlowError):
+    """Raised when Flow refuses a generation because the account is short of credits.
+
+    **Short of, not necessarily out of.** Veo tiers cost different amounts, so the
+    threshold is per-model: measured 2026-09-07, `ci-probe` held **50** credits and
+    still rendered the warning. An empty balance is one way to reach this; an
+    expensive model on a partial balance is another, and the error must not tell a
+    user with credits that they have none.
+
+    Flow does not disable the submit control when the balance falls short — it
+    **replaces** it. The ``arrow_forward`` anchor disappears and a
+    ``prompt-warning-button`` carrying ``aria-label='Insufficient credits warning'``
+    takes its place (note Flow's own word: *insufficient*, not *none*). Measured by
+    A/B on 2026-09-07 on the migrated host: same probe, same code, ~60 s apart, a
+    short account and a funded one rendering the mirror image of each other.
+
+    Finding: ``docs/superpowers/spikes/2026-09-07-credit-shortfall-looks-like-selector-drift.md``.
+
+    That is why this class exists rather than reusing
+    :class:`UiSelectorDriftError`. A missing anchor was being reported as "Google may
+    have updated their frontend — file a bug", over a credit shortfall: a wrong diagnosis
+    pointed at a wrong culprit, which also manufactures frontend-drift reports that no
+    code change can ever fix. Exit code 37 lets a scripted caller branch on "top up the
+    account" versus "the UI moved" (23), which is the whole point of separating them.
+
+    Nothing is submitted when this is raised, so no credit is spent — there were none
+    to spend.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/insufficient-credits"
+    title = "Insufficient Flow credits"
+    _default_remediation = (
+        "Your Google account does not have enough Flow credits for this model, so Flow "
+        "replaced the submit control with its 'Insufficient credits' warning. This is a "
+        "shortfall, not necessarily an empty balance: Veo tiers cost different amounts "
+        "(measured 2026-09-07: an account holding 50 credits still saw the warning), so "
+        "a cheaper model may go through. Check the balance with `gflow credits user`, "
+        "then try a cheaper `--model`, top up, or wait for your allowance to reset. "
+        "Image generation (`gflow image`) draws on a separate daily quota and may still "
+        "work. This is not a gflow-cli bug and does not need a report."
+    )
+
+
+class FlowAgentUiError(GFlowError):
+    """Raised when Google Flow's new Agentic UI cohort is detected at runtime.
+
+    This cohort replaces the classic generation controls with a chat interface
+    that is not supported by gflow-cli. Raising this error allows the CLI to
+    fail cleanly with exit code 25 instead of timing out or raising drift errors.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/flow-agent-ui"
+    title = "Google Flow Agentic UI detected"
+    _default_remediation = (
+        "Your account has been placed in Google Flow's new 'Agentic UI' A/B cohort, "
+        "which removes the classic media generation controls. gflow-cli does not "
+        "currently support driving this interface. Try using a different Chrome profile, "
+        "or wait for a future update. If you need to share a bug report, review the "
+        "screenshot referenced in this message (if any) and any screenshot in the "
+        "incident bundle first — the viewport may show personal info "
+        "(do NOT include tokens or credentials)."
+    )
+
+
+class FlowAppError(GFlowError):
+    """Raised when Google Flow's own app did not give us the page we asked for —
+    not a gflow-cli issue. Either way the editor never rendered, so no generation
+    control exists to drive (exit code 31). **Two measured shapes:**
+
+    1. **Its React error boundary** — the app crashed client-side. Transient;
+       retry works. Detected at the mode-switch raise site via the error-page title.
+    2. **A redirect to Flow's public landing page** (``/about``, #756) — the app
+       declined to open the project for this session. *Why* is still not measured:
+       ``gflow auth status`` reports the session verified while it happens, so the
+       message names the redirect and stops rather than inventing a cause. Whether a
+       retry helps **is** now measured, on a live occurrence caught 2026-09-11: 5/5
+       consecutive attempts landed on ``/about``, over ~3 minutes, on the account's
+       own project with a healthy session — so ``retryable=False`` at that raise site
+       is the measured answer, not the preserved one it was through 2026-09-10.
+       Excluded by that run, narrowly: not an expired session, not a missing project,
+       not transience. Still open: the cause, and whether it ever clears.
+
+    Both otherwise surface as a misleading ``UiSelectorDriftError`` "file a bug" —
+    which is the whole reason this class exists. See
+    ``api/transports/_common.py::raise_if_known_landing``.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/flow-app"
+    title = "Google Flow web app error"
+
+    #: Per-instance override of this class's ``RETRYABLE_ERRORS`` membership; ``None``
+    #: keeps it. It lives HERE and not on ``GFlowError`` because there is exactly one
+    #: producer (``_common.py::raise_if_known_landing``) and one class with two shapes
+    #: that disagree about retrying. ``is_retryable`` reads it by ``getattr``, so a base
+    #: declaration would buy no typing and no test-double visibility — only a field on
+    #: every error in the project. Move it up if, and only if, a second class needs it.
+    retryable: bool | None = None
+    _default_remediation = (
+        "Google Flow did not serve the page gflow asked for — a Flow-side condition, "
+        "not a gflow-cli bug. If it crashed (client-side exception), retry in a moment. "
+        "If it redirected to flow.google.com/about, open the project in a browser on "
+        "that host and confirm this account can reach it."
+    )
+
+    def __init__(self, *args: Any, retryable: bool | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.retryable = retryable
+
+
+class FlowHostMigratedError(GFlowError):
+    """Raised when Flow served the project from ``flow.google.com`` — the origin
+    Google is migrating the app onto (issue #639) — instead of ``labs.google``.
+
+    The migrated frontend is a different build (Angular Material over
+    ``batchexecute``): the labs drivers' ligature selectors miss there at once. The
+    migrated composer drives it for text-to-video, image-to-video and
+    reference-to-video from local files, text-to-image, and image-to-image from
+    local files; every other request still lands here. That is NOT selector rot,
+    and reporting it as
+    :class:`UiSelectorDriftError` (exit 23, "file a bug about the selector") sent
+    operators hunting for the wrong cause.
+
+    **Not retryable** (exit code 36). The handoff is a server-assigned
+    per-account boolean that the labs.google app acts on client-side after a fully
+    authenticated load -- measured 5/5 and 7/7 on a flagged account with no flap
+    (spike 2026-09-04-migrated-host-handoff-mechanism). Earlier text said the
+    migration "flaps per page load" and invited a retry; that was an observation
+    straddling the account's one-time rollout, and a retry into a flagged account
+    cannot succeed. This error does NOT mean gflow supports the migrated
+    frontend; it names the situation so nobody hunts for selector drift.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/flow-host-migrated"
+    title = "Flow served the migrated flow.google.com frontend"
+    _default_remediation = (
+        "Google has moved this account's Flow from labs.google to flow.google.com. "
+        "gflow drives that frontend for text-to-video, image-to-video from a local "
+        "--initial-frame, reference-to-video from local --ref files, text-to-image, "
+        "and image-to-image from local files (no end frame, no UUID or @Name frame, "
+        "no character entities; --project required) "
+        "(GFLOW_CLI_FLOW_HOST=auto, the default, or flow.google.com); you see this "
+        "error because GFLOW_CLI_FLOW_HOST=labs.google switched the migrated composer "
+        "off, or because this request type is not ported to the migrated host yet. "
+        "This is a per-account setting applied on every load, so retrying will not "
+        "land the old frontend. The REST surface (gflow project list, gflow data ...) "
+        "still works. Follow https://github.com/ffroliva/gflow-cli/issues/639 for "
+        "the migrated-frontend feature matrix."
+    )
+
+
+class FlowAccountChooserError(GFlowError):
+    """Raised when Google Flow lands on an account chooser or sign-in hop
+    and the profile's recorded Google account cannot be selected automatically.
+
+    **Not retryable** (exit code 38). Retrying with the same profile and recorded
+    account into a signed-out or missing chooser row cannot succeed without
+    manual operator interaction via gflow auth login.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/flow-account-chooser"
+    title = "Recorded Google account not selectable"
+    _default_remediation = (
+        "Run `gflow auth login --profile <name>` and complete the account chooser "
+        "manually while signed in as the recorded account."
+    )
+
+
+class UiModeUnavailableError(GFlowError):
+    """Raised when the Flow UI arm a command REQUIRES (``--ui-mode`` /
+    ``GFLOW_CLI_UI_MODE``, or inferred — e.g. ``-i`` instructions force agentic)
+    could not be reached, after a best-effort switch + re-probe (issue #299).
+
+    Distinct from ``FlowAgentUiError`` (exit 25 = "gflow cannot drive the
+    agentic UI at all"): here gflow *can* drive both arms (for images — the
+    video pipeline only has a classic driver, #299), but the caller needs
+    a specific one and the server would not switch to it, so we abort **before**
+    submitting — zero credits spent. The cohort is server-assigned per page load
+    and flaps, so this failure is **retryable**: a re-run often lands the wanted
+    arm. Exit code 28 lets scripts branch on "retry / switch profile / relax
+    --ui-mode" vs a generic error.
+
+    ``requested`` carries the ``UiMode`` that could not be reached.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/ui-mode-unavailable"
+    title = "Requested Flow UI mode unavailable"
+
+    def __init__(self, requested: object, *, remediation_hint: str | None = None) -> None:
+        self.requested = requested
+        arm = getattr(requested, "value", str(requested))
+        other = "agentic" if arm == "classic" else "classic"
+        self._default_remediation = (
+            f"This command required the '{arm}' Flow UI but the arm could not be "
+            f"reached on this profile. Aborted before submitting — no credits were "
+            f"spent. The cohort flaps per page load, so RETRY (a re-run often lands "
+            f"'{arm}'); or try a different --profile; or relax to --ui-mode "
+            f"{other}/auto if the command allows it. Note: a server-side experiment "
+            f"can pin the arm, in which case '{arm}' cannot be reached from the client."
+        )
+        super().__init__(
+            f"Required Flow UI mode '{arm}' is unavailable on this profile.",
+            remediation_hint=remediation_hint,
+        )
+
+
+class MediaAttributionError(GFlowError):
+    """Raised when generated media cannot be reliably attributed to the request
+    that produced it (issue #281).
+
+    Canonical case: the agentic driver's ``await_images`` polls the DOM for
+    new ``<img name=<uuid>>`` tiles. A lazily-rendered pre-existing project
+    asset can appear in the DOM after generation starts and be mistaken for
+    "new" media, or more new UUIDs can appear than were requested — either
+    way there is no reliable signal for WHICH uuid(s) belong to this
+    generation. Rather than guess by slicing an unordered UUID set (the
+    2026-07-10 production incident: a pre-existing logo was silently
+    downloaded and reported as a fresh generation), the driver raises this
+    error and lets the caller re-run.
+
+    Fail-fast over silent-wrong: an error the user sees beats a wrong
+    artifact reported as success (precedent: the ``--model`` silent no-op,
+    PR #48).
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/media-attribution"
+    title = "Generated media could not be attributed"
+    _default_remediation = (
+        "gflow could not reliably attribute the generated media to this request. "
+        "Re-run the generation; a dedicated project with fewer pre-existing "
+        "assets avoids lazy-render ambiguity (issue #281)."
+    )
+
+
+class ReferenceNotFoundError(GFlowError):
+    """Raised when a named remote reference is absent from the project picker.
+
+    Canonical case (#493 recon, 2026-08-14): a remote reference NAME
+    (``ref_names`` — a DTO/MCP field, not a CLI flag) searches Flow's
+    media picker, which indexes Flow's own **short auto-caption** — not the
+    generation prompt. Passing a prompt therefore never matches, and the miss
+    used to surface as a bare Playwright ``TimeoutError`` after 8 s: no typed
+    error, no exit code to branch on, and no indication that the *name* was the
+    problem rather than the UI. The raw picker/catalog comparison is recorded in
+    ``docs/superpowers/spikes/2026-08-15-picker-tile-alt-text.md``.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/reference-not-found"
+    title = "Referenced media was not found"
+    _default_remediation = (
+        "The named asset is not in this project's media picker. Flow indexes a short "
+        "auto-caption, not the generation prompt, so a prompt used as a reference NAME "
+        "will not match. Reference the asset by its media UUID, pass a local file with "
+        "--ref, or check what exists with `gflow data list images`."
+    )
+
+
+class MediaUploadRejectedError(GFlowError):
+    """Raised when Flow's upload endpoint refuses a media file (issue #287).
+
+    Canonical case: the ``uploadImage`` XHR for an i2v frame returns a 4xx —
+    some byte-identical-format siblings upload fine while one file's metadata
+    segment upsets the endpoint. Previously this surfaced as a bare
+    ``RuntimeError`` → generic "Unexpected error." (exit 1) with no hint that
+    the *input image* was refused, costing a diagnosis round-trip.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/media-upload-rejected"
+    title = "Flow rejected a media upload"
+    _default_remediation = (
+        "Flow's upload endpoint refused the file, so the generation was aborted "
+        "before spending credits. Try re-encoding the image to strip metadata "
+        "(e.g. `ffmpeg -i in.jpg -q:v 2 -map_metadata -1 out.jpg`), or reference "
+        "the asset by its media UUID if it already exists in the project."
+    )
+
+
+class MentionIndexUnavailableError(GFlowError):
+    """Raised when a prompt contains an ``@mention`` but a catalog source
+    needed to resolve it (character entities or media assets) is unavailable.
+
+    Distinct from an empty source: a source that loads successfully with zero
+    rows is NOT an outage -- resolution proceeds and reports the mention as
+    unknown via the normal ``resolve_mentions()`` path. This error is raised
+    only when the source loader itself failed (a Flow API error for
+    characters, a data-store error for media), so an outage is never silently
+    indistinguishable from "no matching asset" (fail closed instead of
+    degrading to an empty index).
+
+    ``detail`` names WHICH source failed ("character" or "media") but never
+    includes prompt text or catalog content. The original failure is
+    preserved as ``__cause__`` for diagnostics.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/mention-index-unavailable"
+    title = "Mention index unavailable"
+    _default_remediation = (
+        "gflow could not load the asset catalog needed to resolve an @mention. "
+        "Check network connectivity (character source) or GFLOW_CLI_DB_PATH / "
+        "filesystem permissions (media source), then retry."
+    )
+
+
+class QueueSchemaError(GFlowError):
+    """Raised when a worker-queue task payload's schema is invalid or unknown
+    (Task C2 — versioned queue codec, design spec §3).
+
+    Covers: an unrecognized ``schema_version`` (anything other than the
+    implicit legacy 0 or the current 1), an unknown ``task_type``
+    discriminator, or a payload that fails structural validation (missing
+    required field, invalid enum, out-of-range count, malformed path) when
+    mapped onto the existing typed ``GenerateImageRequest`` /
+    ``GenerateVideoRequest`` DTOs.
+
+    Raised by ``worker/codec.py`` BEFORE Playwright starts — no browser
+    launch, no credit spend. An unknown version is a stable, typed failure;
+    it is never interpreted optimistically. ``detail`` is redacted and never
+    echoes prompt text.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/queue-schema"
+    title = "Worker queue payload schema is invalid"
+    _default_remediation = (
+        "The queued task's payload could not be decoded. This usually means "
+        "gflow-cli was downgraded after a newer version enqueued the task, or "
+        "the payload was hand-edited. Re-enqueue the task with a compatible "
+        "gflow-cli version."
+    )
+
+
+class SecurityError(GFlowError):
+    """Raised when a security boundary is violated (e.g. profile_dir outside HOME)."""
+
+    problem_type = "https://gflow-cli.dev/errors/security"
+    title = "Security violation"
+    _default_remediation = "Ensure all file paths are within the allowed GFLOW_CLI_HOME directory."
+
+
+class AuthMissingError(GFlowError):
+    """Raised when a profile lacks a usable session for the requested action.
+
+    Covers both a wholly absent session and the issue-#15 case: a profile
+    signed in to Google but not to the Flow app (no NextAuth session). The
+    raising site supplies a message and `remediation_hint` describing which.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/auth-missing"
+    title = "Authentication credential missing"
+    _default_remediation = (
+        "No usable Flow session was found in the profile. "
+        "Run `gflow auth login --profile <name>` and complete the Flow sign-in."
+    )
+
+
+class AuthLoginTimeoutError(GFlowError):
+    """Raised when the interactive login polling loop exceeds its deadline.
+
+    Distinct from TransportTimeoutError (which covers API call timeouts).
+    This error means the user/agent did not complete the sign-in flow within
+    the allowed window.  Exit code 12 lets agents branch on timeout vs
+    config vs security failures without parsing stderr.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/auth-login-timeout"
+    title = "Login timed out"
+    _default_remediation = (
+        "The sign-in was not completed within the allowed time. "
+        "Run `gflow auth login` again and complete sign-in promptly. "
+        "Increase GFLOW_CLI_AUTH_LOGIN_TIMEOUT (seconds) if you need more time."
+    )
+
+
+class AuthBrowserRejectedError(GFlowError):
+    """Raised when Google rejects the login browser before sign-in can complete."""
+
+    problem_type = "https://gflow-cli.dev/errors/auth-browser-rejected"
+    title = "Login browser rejected"
+    _default_remediation = (
+        "Google's sign-in rejected this browser for advertising automation "
+        "(navigator.webdriver), not for being Chromium. Re-run `gflow auth login`; "
+        "with Google Chrome installed, the `chrome` strategy retries automatically "
+        "on a path with no automation surface."
+    )
+
+
+class BrowserSessionClosedError(GFlowError):
+    """Raised when the underlying Playwright page/context/browser is closed.
+
+    Translated from Playwright's TargetClosedError at the FlowApiClient
+    boundary so long-lived workers can catch a stable, library-owned class
+    and decide to recreate the client (via its async context manager)
+    instead of importing from ``playwright._impl._errors``.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/browser-session-closed"
+    title = "Browser session closed"
+    _default_remediation = (
+        "The Playwright browser/page used by this FlowApiClient is no longer "
+        "alive. Recreate the client via `async with FlowApiClient(...)` and "
+        "retry the operation."
+    )
+
+
+class BatchPartialError(GFlowError):
+    """Raised by `generate_images_batch` under fail-fast when one prompt failed
+    after others already produced ready-to-download results.
+
+    Carries `partial_results` (tuple of completed `BatchSubmissionResult`)
+    so the orchestrator can still download the user's already-paid-for
+    images before surfacing the underlying error.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/batch-partial"
+    title = "Batch partially failed"
+    _default_remediation = (
+        "One or more prompts in the batch failed; check individual prompt errors "
+        "or retry the failed items."
+    )
+
+    def __init__(
+        self,
+        detail: str = "",
+        *,
+        status: int | None = None,
+        instance: str | None = None,
+        route: str = "",
+        remediation_hint: str | None = None,
+        partial_results: tuple[Any, ...] = (),
+        cause: Exception | None = None,
+    ) -> None:
+        super().__init__(
+            detail,
+            status=status,
+            instance=instance,
+            route=route,
+            remediation_hint=remediation_hint,
+        )
+        self.partial_results = partial_results
+        self.cause = cause
+
+
+class BatchIntegrityError(GFlowError):
+    """Raised by the orchestrator after a batch returns when the on-disk file
+    count does not match the expected count. Catches silent mis-delivery
+    even when transport-layer status is reported as 'ok'.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/batch-integrity"
+    title = "Batch integrity check failed"
+    _default_remediation = (
+        "The generated image count did not match expectations; retry the batch operation."
+    )
+
+    def __init__(
+        self,
+        detail: str = "",
+        *,
+        status: int | None = None,
+        instance: str | None = None,
+        route: str = "",
+        remediation_hint: str | None = None,
+        prompt_indices: tuple[int, ...] = (),
+    ) -> None:
+        super().__init__(
+            detail,
+            status=status,
+            instance=instance,
+            route=route,
+            remediation_hint=remediation_hint,
+        )
+        self.prompt_indices = prompt_indices
+
+
+class DataStoreError(GFlowError):
+    """Raised when the local data layer cannot open, read, or write SQLite."""
+
+    problem_type = "https://gflow-cli.dev/errors/data-store"
+    title = "Data store error"
+    _default_remediation = "Check database file permissions or run 'gflow data errors prune'"
+
+
+class DataMigrationError(DataStoreError):
+    """Raised when local SQLite schema migration cannot proceed safely."""
+
+    problem_type = "https://gflow-cli.dev/errors/data-migration"
+    title = "Data migration error"
+
+
+class DataIntegrityError(DataStoreError):
+    """Raised when repository writes violate expected local DB constraints."""
+
+    problem_type = "https://gflow-cli.dev/errors/data-integrity"
+    title = "Data integrity error"
+
+
+class FrameExtractionError(GFlowError):
+    """Raised when the video-chain last-frame extractor cannot produce a frame.
+
+    Covers both the missing-optional-dependency case (PyAV / ``av`` not
+    installed because the ``chain`` extra was skipped) and an undecodable /
+    truncated input video. The remediation points at the install extra so an
+    operator hitting the missing-dependency path can self-serve.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/frame-extraction"
+    title = "Last-frame extraction failed"
+    _default_remediation = (
+        "Verify input video file is readable and non-corrupt. Ensure "
+        "gflow-cli[chain] dependencies (PyAV) are installed."
+    )
+
+
+class ChainPartialError(GFlowError):
+    """Raised when a sequential video chain fails mid-way after earlier links
+    already produced ready-on-disk clips.
+
+    Mirrors ``BatchPartialError`` but for the video chain: ``partial_results``
+    carries the ``Path`` of each completed link so the already-paid-for clips
+    are surfaced rather than lost. The default is an empty (but present) list —
+    a chain that fails before its first link completes is still a valid partial
+    with zero results, NEVER ``None``.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/chain-partial"
+    title = "Video chain partially failed"
+    _default_remediation = (
+        "An earlier link in the chain succeeded but a later one failed. The "
+        "completed clips are preserved; re-run with --resume-from to continue "
+        "from the first failed link instead of regenerating the whole chain."
+    )
+
+    def __init__(
+        self,
+        detail: str = "",
+        *,
+        status: int | None = None,
+        instance: str | None = None,
+        route: str = "",
+        remediation_hint: str | None = None,
+        partial_results: list[Path] | None = None,
+        cause: Exception | None = None,
+    ) -> None:
+        super().__init__(
+            detail,
+            status=status,
+            instance=instance,
+            route=route,
+            remediation_hint=remediation_hint,
+        )
+        self.partial_results: list[Path] = partial_results if partial_results is not None else []
+        self.cause = cause
+
+
+class ChainManifestError(ConfigurationError):
+    """Raised when a chain manifest file cannot be parsed into chain links.
+
+    A configuration/input error (bad JSON, missing ``prompt``, unknown model
+    alias, non-int duration, invalid aspect, or an empty manifest). The
+    ``detail`` cites the offending line number where applicable. Inherits
+    ``ConfigurationError``'s exit code (11) via the EXIT_CODE_MAP isinstance
+    walk — no dedicated code is needed because, like other configuration
+    mistakes, it is a "fix your input and re-run" failure.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/chain-manifest"
+    title = "Chain manifest is invalid"
+    _default_remediation = (
+        "Fix the chain manifest: it is a JSONL file with one JSON object per "
+        'line, each requiring a non-empty "prompt"; optional per-link overrides '
+        'are "model", "duration" (int), and "aspect" (9:16 | 16:9 | 1:1). '
+        "Blank lines and lines starting with # are ignored, but at least one "
+        "valid link is required."
+    )
+
+
+class SyncPartialError(GFlowError):
+    """Raised when ``gflow data sync --names`` succeeds for some projects but
+    fails for others (#543).
+
+    Mirrors ``ChainPartialError``/``BatchPartialError``: the writes for the
+    projects that succeeded are already committed; ``summary`` carries the
+    :class:`gflow_cli.services.catalog_sync.SyncSummary` (typed loosely here to
+    keep errors.py dependency-light) including the per-project failure records.
+    Retryable — sync is idempotent, so a re-run continues where it left off.
+    """
+
+    problem_type = "https://gflow-cli.dev/errors/sync-partial"
+    title = "Catalog sync partially failed"
+    _default_remediation = (
+        "Some projects synced; others failed. Sync is idempotent — re-run "
+        "`gflow data sync --names` and it continues where it left off, "
+        "revisiting only rows that are still nameless."
+    )
+
+    def __init__(
+        self,
+        detail: str = "",
+        *,
+        status: int | None = None,
+        instance: str | None = None,
+        route: str = "",
+        remediation_hint: str | None = None,
+        summary: Any = None,
+    ) -> None:
+        super().__init__(
+            detail,
+            status=status,
+            instance=instance,
+            route=route,
+            remediation_hint=remediation_hint,
+        )
+        #: SyncSummary of the run (None when raised outside run_sync).
+        self.summary = summary
+
+
+# EXIT_CODE_MAP — most-specific class FIRST per isinstance walk semantics.
+# Subclasses inherit their parent's exit code if they don't have their own
+# entry. New entries MUST go BEFORE their parent class in this dict.
+EXIT_CODE_MAP: dict[type[GFlowError], int] = {
+    ChainPartialError: 21,
+    FrameExtractionError: 20,
+    DataMigrationError: 16,
+    DataIntegrityError: 16,
+    DataStoreError: 16,
+    BrowserSessionClosedError: 15,
+    AuthBrowserRejectedError: 14,
+    AuthLoginTimeoutError: 12,
+    SecurityError: 13,
+    AuthMissingError: 8,
+    TransportTimeoutError: 9,
+    WafRejectionError: 10,
+    # UpscaleUnavailableError (issue #171): tier-gated 4K upscale 403, DISTINCT
+    # from WafRejectionError's 10 even though both are HTTP 403. Direct GFlowError
+    # subclass, so unconstrained by the ordering invariant.
+    UpscaleUnavailableError: 22,
+    ExtendUnavailableError: 35,
+    # UiSelectorDriftError (issue #183): Flow UI changed, selector probe failed.
+    # Direct GFlowError subclass; exit 23 lets scripts distinguish "UI drifted"
+    # from generic error (1) without parsing stderr.
+    UiSelectorDriftError: 23,
+    InsufficientCreditsError: 37,
+    # ModelModeIncompatibilityError + VideoModelSelectionError BEFORE
+    # ConfigurationError (their parent) so the isinstance walk lands on 17/18,
+    # not 11. Per [[exit-code-map-ordering-invariant-test-pitfall]].
+    ModelModeIncompatibilityError: 17,
+    VideoModelSelectionError: 18,
+    # BrowserEngineUnavailableError (Patchright engine opt-in): BEFORE
+    # ConfigurationError (its parent) so the isinstance walk lands on 24, not 11.
+    BrowserEngineUnavailableError: 24,
+    FlowAgentUiError: 25,
+    FlowAppError: 31,
+    # FlowHostMigratedError (#639): Flow served the migrated
+    # flow.google.com frontend for a request not ported to it yet. Direct
+    # GFlowError subclass; exit 36 lets scripts distinguish "wrong Flow
+    # frontend" (per-account, not retryable) from genuine selector drift
+    # (23), which it used to masquerade as.
+    FlowHostMigratedError: 36,
+    # FlowAccountChooserError: Google Flow landed on account chooser
+    # and the recorded account row could not be selected automatically.
+    # Direct GFlowError subclass; exit 38 distinguishes account chooser stall
+    # from generic errors (1) without parsing stderr.
+    FlowAccountChooserError: 38,
+    # UiModeUnavailableError (issue #299): a command's required arm (--ui-mode /
+    # inferred) couldn't be reached after a best-effort switch. Direct GFlowError
+    # subclass — retryable policy abort, distinct from FlowAgentUiError (25).
+    UiModeUnavailableError: 28,
+    # MediaAttributionError (issue #281): generated media could not be
+    # reliably attributed (agentic DOM-scrape ambiguity, or a downstream
+    # already-recorded check). Direct GFlowError subclass; exit 26 lets
+    # scripts distinguish "wrong/ambiguous media" from a generic error (1).
+    MediaAttributionError: 26,
+    # MediaUploadRejectedError (issue #287): Flow's upload endpoint refused the
+    # input file (uploadImage 4xx). Direct GFlowError subclass; exit 27 lets
+    # scripts branch on "re-encode the input image" vs generic error (1).
+    MediaUploadRejectedError: 27,
+    # ReferenceNotFoundError (#493 recon): a reference name identified an asset the
+    # project picker does not offer. Direct GFlowError subclass; exit 32 lets scripts
+    # distinguish "that name is not in the picker" from a UI drift error (23),
+    # which is what this previously masqueraded as via a raw TimeoutError.
+    ReferenceNotFoundError: 32,
+    # MentionIndexUnavailableError: an @mention was present but the catalog
+    # source needed to resolve it (character or media) failed to load.
+    # Direct GFlowError subclass; exit 29 lets scripts distinguish "the
+    # catalog is unreachable" from an unknown-mention ConfigurationError (11).
+    MentionIndexUnavailableError: 29,
+    # QueueSchemaError (Task C2): a worker-queue payload's schema_version is
+    # unknown, or its fields fail validation against the typed request DTOs.
+    # Direct GFlowError subclass; exit 30 lets scripts distinguish "the queue
+    # row is malformed/from an incompatible version" from generic error (1).
+    QueueSchemaError: 30,
+    # SyncPartialError (#543): `gflow data sync --names` wrote some projects
+    # but not all. Direct GFlowError subclass; exit 34 lets scripts distinguish
+    # "partially synced, just re-run" from generic error (1).
+    SyncPartialError: 34,
+    ConfigurationError: 11,
+    AuthExpiredError: 3,
+    RateLimitError: 4,
+    ContentPolicyError: 5,
+    NetworkError: 6,
+    WireFormatError: 7,
+    SceneConcatError: 19,
+    # FlowApiError omitted — falls through to default 1
+}
+
+# Transient failures the caller can retry without operator intervention — WAF
+# bounce, rate-limit/quota, transport timeout, network blip, a dropped browser
+# session, a Flow web-app crash (31), or an agentic-cohort flap (25). Everything
+# else (auth/content-policy/config/security) is terminal: retrying the identical
+# request will fail the same way. Single source of truth for the CLI --json, MCP,
+# and worker error envelopes — never fork a private copy of this list.
+RETRYABLE_ERRORS: tuple[type[GFlowError], ...] = (
+    WafRejectionError,
+    RateLimitError,
+    TransportTimeoutError,
+    NetworkError,
+    BrowserSessionClosedError,
+    FlowAppError,
+    FlowAgentUiError,
+    # #639 is deliberately NOT here. FlowHostMigratedError used to be listed on
+    # the belief that the migration "flaps per page load"; it is a server-assigned
+    # per-account boolean (5/5, 7/7 measured 2026-09-04), so a retry into it is
+    # a doomed attempt. Exit 36 stays; the machine flag no longer invites the loop.
+    # #299: the cohort is server-assigned per page load and flaps — the
+    # documented remediation for exit 28 IS "retry"; the machine flag must
+    # agree with the docs.
+    UiModeUnavailableError,
+    # #543: sync is idempotent — the documented remediation for exit 34 IS
+    # "re-run"; the machine flag must agree with the docs.
+    SyncPartialError,
+)
+
+
+def is_retryable(exc: GFlowError) -> bool:
+    """Shared retry classification consumed by every machine-readable error surface.
+
+    The class answer (``RETRYABLE_ERRORS``) unless the raise site overrode it — see
+    ``FlowAppError.retryable``.
+
+    ``isinstance(..., bool)`` rather than a truthiness test, deliberately: a
+    ``MagicMock`` answers every ``getattr`` with a truthy child mock, so
+    ``if override is not None`` would silently report **every** mocked error as
+    retryable and no assertion in the suite would notice
+    (memory ``magicmock-truthy-getattr-silences-guards``).
+    """
+    override = getattr(exc, "retryable", None)
+    if isinstance(override, bool):
+        return override
+    return isinstance(exc, RETRYABLE_ERRORS)

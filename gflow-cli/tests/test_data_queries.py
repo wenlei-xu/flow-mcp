@@ -1,0 +1,718 @@
+"""Tests for gflow_cli.data.queries — pure read-only query functions."""
+
+from __future__ import annotations
+
+import sqlite3
+import uuid
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+from gflow_cli.data.models import (
+    AssetKind,
+    AssetRecord,
+    LocalFileRecord,
+    OperationAssetRole,
+    OperationKind,
+    OperationRecord,
+    OperationStatus,
+    ProjectRecord,
+)
+from gflow_cli.data.queries import (
+    _LIST_IMAGES_ALL_COPIES_SQL,
+    _LIST_IMAGES_SQL,
+    _LIST_VIDEOS_ALL_COPIES_SQL,
+    _LIST_VIDEOS_SQL,
+    get_asset_prompt,
+    list_images,
+    list_profiles,
+    list_project_media_assets,
+    list_projects,
+    list_videos,
+)
+from gflow_cli.data.repository import DataRepository
+from gflow_cli.data.store import DataStore
+from tests.fixtures.seeded_catalog import build_seeded_catalog
+
+
+@pytest.fixture
+def seeded(tmp_path: Path) -> Path:
+    db = tmp_path / "test.db"
+    build_seeded_catalog(db)
+    return db
+
+
+# ---------------------------------------------------------------------------
+# Empty / missing DB — regression coverage for #88
+# ---------------------------------------------------------------------------
+
+
+def test_list_profiles_on_missing_db_returns_empty(tmp_path: Path) -> None:
+    """Closes #88 — `data list` used to crash on a missing/empty DB because the
+    raw sqlite3.connect path skipped migrations. After routing through
+    DataStore.open, missing/empty DBs are auto-migrated and queries return []."""
+    missing = tmp_path / "does_not_exist.db"
+    assert not missing.exists()
+    rows = list_profiles(db_path=missing, limit=20, offset=0)
+    assert rows == []
+    # DataStore.open creates the file (with schema) — that's the contract.
+    assert missing.exists()
+
+
+def test_list_all_kinds_on_freshly_created_db_returns_empty(tmp_path: Path) -> None:
+    """All four `list_*` functions must tolerate a freshly-created empty DB."""
+    fresh = tmp_path / "fresh.db"
+    assert list_profiles(db_path=fresh, limit=20, offset=0) == []
+    assert list_projects(db_path=fresh, profile=None, limit=20, offset=0) == []
+    assert list_images(db_path=fresh, profile=None, limit=20, offset=0) == []
+    assert list_videos(db_path=fresh, profile=None, limit=20, offset=0) == []
+
+
+def test_list_project_media_assets(seeded: Path, tmp_path: Path) -> None:
+    """The @-mention AssetIndex reads media by project from the catalog: it
+    returns ``media_id`` + ``display_name`` (from ``metadata_json``), falls back
+    to ``""`` when the name is absent, and returns ``[]`` for an unknown project.
+    """
+    from gflow_cli.data.repository import DataRepository
+    from gflow_cli.data.store import DataStore
+
+    project = "flow-proj-alice-000"
+
+    # Add one asset that carries a display_name in its metadata_json.
+    with DataStore.open(seeded) as store:
+        repo = DataRepository(store)
+        repo.upsert_asset(
+            AssetRecord(
+                id=str(uuid.uuid4()),
+                profile_name="alice",
+                flow_project_id=project,
+                flow_media_id="named-media-1",
+                flow_workflow_id=None,
+                flow_media_generation_id=None,
+                kind=AssetKind.IMAGE,
+                status="ready",
+                model="imagen-3.0-fast-generate-001",
+                aspect_ratio="16:9",
+                width=1280,
+                height=720,
+                duration_seconds=None,
+                seed=9,
+                metadata_json={"display_name": "Logo"},
+                created_at=datetime.now(UTC).isoformat(),
+            )
+        )
+
+    rows = list_project_media_assets(db_path=seeded, project_id=project)
+    by_id = {r["media_id"]: r["display_name"] for r in rows}
+
+    assert by_id["named-media-1"] == "Logo"
+    # Seeded assets carry an empty metadata_json → display_name falls back to "".
+    assert by_id["img-media-alice-0-0"] == ""
+    # An unknown project has no media.
+    assert list_project_media_assets(db_path=seeded, project_id="flow-proj-none") == []
+
+
+def test_list_projects_returns_all_by_default(seeded: Path) -> None:
+    rows = list_projects(db_path=seeded, profile=None, limit=20, offset=0)
+    assert len(rows) == 4
+    assert {r.profile for r in rows} == {"alice", "bob", "carol"}
+    assert {r.title for r in rows} == {
+        "alice project 0",
+        "alice project 1",
+        "bob project 0",
+        "carol project 0",
+    }
+
+
+def test_repository_update_project_title_and_get_project(tmp_path: Path) -> None:
+    db = tmp_path / "repo_project.db"
+    with DataStore.open(db) as store:
+        repo = DataRepository(store)
+        now = datetime.now(UTC).isoformat()
+        repo.upsert_profile("alice", tmp_path / "alice")
+        record = ProjectRecord(
+            id=str(uuid.uuid4()),
+            profile_name="alice",
+            flow_project_id="proj-123",
+            title="Initial Title",
+            source="cli",
+            created_at=now,
+        )
+        repo.upsert_project(record)
+
+        fetched = repo.get_project("alice", "proj-123")
+        assert fetched is not None
+        assert fetched.flow_project_id == "proj-123"
+        assert fetched.title == "Initial Title"
+
+        # Lookup without profile
+        fetched_no_prof = repo.get_project(None, "proj-123")
+        assert fetched_no_prof is not None
+        assert fetched_no_prof.title == "Initial Title"
+
+        # Update title
+        repo.update_project_title("alice", "proj-123", "New Renamed Title")
+        updated = repo.get_project("alice", "proj-123")
+        assert updated is not None
+        assert updated.title == "New Renamed Title"
+
+        # Unknown project returns None
+        assert repo.get_project("alice", "unknown-proj") is None
+
+
+def test_list_projects_filters_by_profile(seeded: Path) -> None:
+    rows = list_projects(db_path=seeded, profile="alice", limit=20, offset=0)
+    assert len(rows) == 2
+    assert all(r.profile == "alice" for r in rows)
+
+
+def test_list_projects_respects_limit(seeded: Path) -> None:
+    rows = list_projects(db_path=seeded, profile=None, limit=2, offset=0)
+    assert len(rows) == 2
+
+
+def test_list_projects_respects_offset(seeded: Path) -> None:
+    page1 = list_projects(db_path=seeded, profile=None, limit=2, offset=0)
+    page2 = list_projects(db_path=seeded, profile=None, limit=2, offset=2)
+    assert {r.project_id for r in page1} & {r.project_id for r in page2} == set()
+
+
+def test_list_projects_newest_first(seeded: Path) -> None:
+    rows = list_projects(db_path=seeded, profile=None, limit=20, offset=0)
+    timestamps = [r.created_at for r in rows]
+    assert timestamps == sorted(timestamps, reverse=True)
+
+
+def test_list_projects_image_video_counts(seeded: Path) -> None:
+    """Aggregates from assets table where kind = 'image' / 'video'."""
+    rows = list_projects(db_path=seeded, profile="alice", limit=20, offset=0)
+    # Alice has 2 projects, each with 2 images + 1 video
+    for r in rows:
+        assert r.image_count == 2
+        assert r.video_count == 1
+
+
+def test_list_projects_image_video_counts_profile_scoped(tmp_path: Path) -> None:
+    """Issue #113: Ensure image/video counts do not leak across profiles sharing
+    a flow_project_id.
+    """
+    db = tmp_path / "shared_project.db"
+    with DataStore.open(db) as store:
+        repo = DataRepository(store)
+        now = datetime.now(UTC).isoformat()
+
+        # Two profiles
+        repo.upsert_profile("alice", tmp_path / "alice")
+        repo.upsert_profile("bob", tmp_path / "bob")
+
+        # Both share the same flow_project_id
+        shared_flow_id = "shared-proj-id"
+
+        repo.upsert_project(
+            ProjectRecord(
+                id=str(uuid.uuid4()),
+                profile_name="alice",
+                flow_project_id=shared_flow_id,
+                title="alice view",
+                source="cli",
+                created_at=now,
+            )
+        )
+        repo.upsert_project(
+            ProjectRecord(
+                id=str(uuid.uuid4()),
+                profile_name="bob",
+                flow_project_id=shared_flow_id,
+                title="bob view",
+                source="cli",
+                created_at=now,
+            )
+        )
+
+        # Alice gets 1 image
+        repo.upsert_asset(
+            AssetRecord(
+                id=str(uuid.uuid4()),
+                profile_name="alice",
+                flow_project_id=shared_flow_id,
+                flow_media_id="alice-img-1",
+                flow_workflow_id=None,
+                flow_media_generation_id=None,
+                kind=AssetKind.IMAGE,
+                status="ready",
+                model="test-model",
+                aspect_ratio="1:1",
+                width=512,
+                height=512,
+                duration_seconds=None,
+                seed=None,
+                metadata_json={},
+                created_at=now,
+            )
+        )
+
+        # Bob gets 2 images, 1 video
+        for i in range(2):
+            repo.upsert_asset(
+                AssetRecord(
+                    id=str(uuid.uuid4()),
+                    profile_name="bob",
+                    flow_project_id=shared_flow_id,
+                    flow_media_id=f"bob-img-{i}",
+                    flow_workflow_id=None,
+                    flow_media_generation_id=None,
+                    kind=AssetKind.IMAGE,
+                    status="ready",
+                    model="test-model",
+                    aspect_ratio="1:1",
+                    width=512,
+                    height=512,
+                    duration_seconds=None,
+                    seed=None,
+                    metadata_json={},
+                    created_at=now,
+                )
+            )
+        repo.upsert_asset(
+            AssetRecord(
+                id=str(uuid.uuid4()),
+                profile_name="bob",
+                flow_project_id=shared_flow_id,
+                flow_media_id="bob-vid-1",
+                flow_workflow_id=None,
+                flow_media_generation_id=None,
+                kind=AssetKind.VIDEO,
+                status="ready",
+                model="test-model",
+                aspect_ratio="1:1",
+                width=512,
+                height=512,
+                duration_seconds=1.0,
+                seed=None,
+                metadata_json={},
+                created_at=now,
+            )
+        )
+
+    # Query without profile filter returns projects for both profiles
+    rows = list_projects(db_path=db, profile=None, limit=20, offset=0)
+    assert len(rows) == 2
+
+    rows_by_profile = {r.profile: r for r in rows}
+
+    # Assert counts are scoped to the profile, not leaking across the shared flow_project_id
+    assert rows_by_profile["alice"].image_count == 1
+    assert rows_by_profile["alice"].video_count == 0
+
+    assert rows_by_profile["bob"].image_count == 2
+    assert rows_by_profile["bob"].video_count == 1
+
+
+def test_list_projects_empty_catalog_returns_empty_list(tmp_path: Path) -> None:
+    """Open a fresh DB with migrations only — no seed data."""
+    from gflow_cli.data.store import DataStore
+
+    db = tmp_path / "empty.db"
+    DataStore.open(db).close()  # runs migrations, then closes
+    rows = list_projects(db_path=db, profile=None, limit=20, offset=0)
+    assert rows == []
+
+
+# ─── list_images ──────────────────────────────────────────────────────────────
+
+
+def test_list_images_returns_all_by_default(seeded: Path) -> None:
+    rows = list_images(db_path=seeded, profile=None, limit=20, offset=0)
+    assert len(rows) == 8
+
+
+def test_list_images_filters_by_profile(seeded: Path) -> None:
+    rows = list_images(db_path=seeded, profile="alice", limit=20, offset=0)
+    assert len(rows) == 4
+    assert all(r.profile == "alice" for r in rows)
+
+
+def test_list_images_newest_first(seeded: Path) -> None:
+    rows = list_images(db_path=seeded, profile=None, limit=20, offset=0)
+    timestamps = [r.created_at for r in rows]
+    assert timestamps == sorted(timestamps, reverse=True)
+
+
+def test_list_images_carries_prompt_aspect_model_local_path(seeded: Path) -> None:
+    rows = list_images(db_path=seeded, profile="alice", limit=1, offset=0)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r.prompt is not None  # operation seeded, so JOIN finds it
+    assert r.aspect == "16:9"
+    assert r.model  # non-empty; fixture uses Flow's real model identifier
+    assert r.local_path is not None
+    assert r.local_path.endswith(".png")
+    assert r.copy_count == 1  # seeded catalog has one local_file per asset
+
+
+def test_list_images_pagination(seeded: Path) -> None:
+    page1 = list_images(db_path=seeded, profile=None, limit=4, offset=0)
+    page2 = list_images(db_path=seeded, profile=None, limit=4, offset=4)
+    assert {r.media_id for r in page1} & {r.media_id for r in page2} == set()
+
+
+# ─── list_videos ──────────────────────────────────────────────────────────────
+
+
+def test_list_videos_returns_all_by_default(seeded: Path) -> None:
+    rows = list_videos(db_path=seeded, profile=None, limit=20, offset=0)
+    assert len(rows) == 2
+    assert all(r.profile == "alice" for r in rows)
+
+
+def test_list_videos_filter_no_match(seeded: Path) -> None:
+    rows = list_videos(db_path=seeded, profile="bob", limit=20, offset=0)
+    assert rows == []
+
+
+def test_list_videos_carries_duration(seeded: Path) -> None:
+    rows = list_videos(db_path=seeded, profile="alice", limit=1, offset=0)
+    assert rows[0].duration > 0  # float, e.g. 6.0
+
+
+# ─── list_profiles ────────────────────────────────────────────────────────────
+
+
+def test_list_profiles_returns_catalog_known_profiles(seeded: Path) -> None:
+    rows = list_profiles(db_path=seeded, limit=20, offset=0)
+    assert {r.profile_name for r in rows} == {"alice", "bob", "carol"}
+
+
+def test_list_profiles_carries_aggregate_counts(seeded: Path) -> None:
+    rows = list_profiles(db_path=seeded, limit=20, offset=0)
+    by_name = {r.profile_name: r for r in rows}
+    assert by_name["alice"].project_count == 2
+    assert by_name["alice"].image_count == 4  # 2 projects × 2 images
+    assert by_name["alice"].video_count == 2  # 2 projects × 1 video
+    assert by_name["bob"].project_count == 1
+    assert by_name["bob"].image_count == 2
+    assert by_name["bob"].video_count == 0
+
+
+def test_list_profiles_sorted_by_last_used_desc(seeded: Path) -> None:
+    rows = list_profiles(db_path=seeded, limit=20, offset=0)
+    timestamps = [r.last_used_at for r in rows]
+    assert timestamps == sorted(timestamps, reverse=True)
+
+
+# ─── multi-copy aggregation ───────────────────────────────────────────────────
+
+
+def _build_multi_copy_db(db_path: Path) -> None:
+    """One image asset with two local_files rows (different paths)."""
+    with DataStore.open(db_path) as store:
+        repo = DataRepository(store)
+        now = datetime.now(UTC)
+        repo.upsert_profile("tester", db_path.parent / "profile_tester")
+        repo.upsert_project(
+            ProjectRecord(
+                id=str(uuid.uuid4()),
+                profile_name="tester",
+                flow_project_id="proj-mc",
+                title="multi-copy test",
+                source="cli",
+                created_at=now.isoformat(),
+            )
+        )
+        asset_id = str(uuid.uuid4())
+        repo.upsert_asset(
+            AssetRecord(
+                id=asset_id,
+                profile_name="tester",
+                flow_project_id="proj-mc",
+                flow_media_id="img-mc-001",
+                flow_workflow_id=None,
+                flow_media_generation_id=None,
+                kind=AssetKind.IMAGE,
+                status="ready",
+                model="imagen-3.0-fast-generate-001",
+                aspect_ratio="1:1",
+                width=512,
+                height=512,
+                duration_seconds=None,
+                seed=1,
+                metadata_json={},
+                created_at=now.isoformat(),
+            )
+        )
+        # Two local copies at distinct paths.
+        for i in range(2):
+            repo.upsert_local_file(
+                LocalFileRecord(
+                    id=str(uuid.uuid4()),
+                    profile_name="tester",
+                    asset_id=asset_id,
+                    path=Path(f"/tmp/gflow/tester/copy_{i}.png"),
+                    media_type="image/png",
+                    bytes=1024,
+                    sha256=None,
+                    created_at=(now + timedelta(seconds=i)).isoformat(),
+                )
+            )
+
+
+def test_list_images_aggregated_shows_one_row_with_copy_count(tmp_path: Path) -> None:
+    db = tmp_path / "mc.db"
+    _build_multi_copy_db(db)
+    rows = list_images(db_path=db, profile=None, limit=20, offset=0)
+    assert len(rows) == 1
+    assert rows[0].copy_count == 2
+
+
+def test_list_images_all_copies_shows_one_row_per_file(tmp_path: Path) -> None:
+    db = tmp_path / "mc.db"
+    _build_multi_copy_db(db)
+    rows = list_images(db_path=db, profile=None, limit=20, offset=0, all_copies=True)
+    assert len(rows) == 2
+    assert all(r.media_id == "img-mc-001" for r in rows)
+
+
+def test_list_images_no_local_files_copy_count_is_zero(tmp_path: Path) -> None:
+    """Asset with no local_files should appear with copy_count=0."""
+    with DataStore.open(tmp_path / "zero.db") as store:
+        repo = DataRepository(store)
+        now = datetime.now(UTC).isoformat()
+        repo.upsert_profile("tester", tmp_path / "p")
+        repo.upsert_project(
+            ProjectRecord(
+                id=str(uuid.uuid4()),
+                profile_name="tester",
+                flow_project_id="proj-zero",
+                title="no local",
+                source="cli",
+                created_at=now,
+            )
+        )
+        repo.upsert_asset(
+            AssetRecord(
+                id=str(uuid.uuid4()),
+                profile_name="tester",
+                flow_project_id="proj-zero",
+                flow_media_id="img-zero-001",
+                flow_workflow_id=None,
+                flow_media_generation_id=None,
+                kind=AssetKind.IMAGE,
+                status="ready",
+                model="imagen-3.0-fast-generate-001",
+                aspect_ratio="1:1",
+                width=512,
+                height=512,
+                duration_seconds=None,
+                seed=None,
+                metadata_json={},
+                created_at=now,
+            )
+        )
+    rows = list_images(db_path=tmp_path / "zero.db", profile=None, limit=20, offset=0)
+    assert len(rows) == 1
+    assert rows[0].copy_count == 0
+    assert rows[0].local_path is None
+
+
+# ---------------------------------------------------------------------------
+# Query-plan regression — refs #112
+# ---------------------------------------------------------------------------
+
+
+def _local_files_scan_lines(plan_rows: list[sqlite3.Row]) -> list[str]:
+    """Return plan detail lines that scan the ``local_files`` table directly."""
+    details = [str(row[-1]) for row in plan_rows]
+    return [d for d in details if "local_files" in d and d.lstrip().startswith(("SCAN", "SEARCH"))]
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        _LIST_IMAGES_SQL,
+        _LIST_VIDEOS_SQL,
+        _LIST_IMAGES_ALL_COPIES_SQL,
+        _LIST_VIDEOS_ALL_COPIES_SQL,
+    ],
+    ids=["images-agg", "videos-agg", "images-all-copies", "videos-all-copies"],
+)
+def test_list_queries_use_index_not_full_scan(tmp_path: Path, sql: str) -> None:
+    """#112: every list-images/videos query must reach ``local_files`` through an
+    index, never a full table scan — both the default per-asset aggregation
+    (``GROUP BY asset_id``) and the ``--all-copies`` flat join.
+
+    The covering index is supplied for free by the ``UNIQUE(asset_id, path)``
+    constraint — SQLite's implicit ``sqlite_autoindex_local_files_2`` — so no extra
+    index or migration is warranted (this is why #112 needs no schema change). The
+    assertion matches on "uses an index" rather than the autoindex's name so it stays
+    valid if SQLite renames it or we later add an explicit index. It guards against a
+    schema change (e.g. dropping that UNIQUE constraint) silently regressing the list
+    queries to a full scan.
+    """
+    params = {"profile": None, "limit": 50, "offset": 0}
+    with DataStore.open(tmp_path / "plan.db") as store:
+        plan = store.conn.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall()
+
+    scans = _local_files_scan_lines(plan)
+    assert scans, (
+        f"expected local_files to be reached via an index; plan was {[r[-1] for r in plan]}"
+    )
+    for line in scans:
+        assert "USING" in line and "INDEX" in line, (
+            f"full-scan regression on local_files — expected an index scan, got {line!r}"
+        )
+
+
+def test_local_files_scan_guard_detects_full_scan() -> None:
+    """Proves the guard above is not vacuous: without the ``UNIQUE(asset_id, path)``
+    covering index the same aggregation falls back to a bare ``SCAN local_files``,
+    which :func:`_local_files_scan_lines` flags and the assertion above would reject."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute(
+            "CREATE TABLE local_files (id TEXT PRIMARY KEY, asset_id TEXT NOT NULL, "
+            "path TEXT NOT NULL)"
+        )
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT asset_id, COUNT(*), MAX(path) FROM local_files GROUP BY asset_id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    scans = _local_files_scan_lines(plan)
+    assert scans, "expected a scan over local_files"
+    assert any("USING" not in line or "INDEX" not in line for line in scans), (
+        f"expected a bare full scan without the covering index; got {scans}"
+    )
+
+
+# ─── multi-operation aggregation ──────────────────────────────────────────────
+
+
+def test_list_images_with_multiple_operations_no_duplicate_rows(tmp_path: Path) -> None:
+    """Closes #111 — if multiple operations claim the same output asset, we must
+    not fan out rows in list_images or list_videos."""
+    db = tmp_path / "multi-op.db"
+    with DataStore.open(db) as store:
+        repo = DataRepository(store)
+        now = datetime.now(UTC).isoformat()
+        repo.upsert_profile("tester", tmp_path / "p")
+        repo.upsert_project(
+            ProjectRecord(
+                id="proj-1",
+                profile_name="tester",
+                flow_project_id="proj-op",
+                title="op-test",
+                source="cli",
+                created_at=now,
+            )
+        )
+        asset_id = "asset-multi-op"
+        repo.upsert_asset(
+            AssetRecord(
+                id=asset_id,
+                profile_name="tester",
+                flow_project_id="proj-op",
+                flow_media_id="img-op",
+                flow_workflow_id=None,
+                flow_media_generation_id=None,
+                kind=AssetKind.IMAGE,
+                status="ready",
+                model="test-model",
+                aspect_ratio="1:1",
+                width=512,
+                height=512,
+                duration_seconds=None,
+                seed=None,
+                metadata_json={},
+                created_at=now,
+            )
+        )
+
+        # Insert op 1
+        op1_id = "op-1"
+        repo.insert_operation(
+            OperationRecord(
+                id=op1_id,
+                profile_name="tester",
+                flow_project_id="proj-op",
+                command="image",
+                mode=OperationKind.T2I,
+                status=OperationStatus.SUCCEEDED,
+                flow_operation_id="op1",
+                flow_batch_id=None,
+                prompt="First prompt",
+                prompt_hash=None,
+                prompt_redacted=False,
+                model="test-model",
+                aspect_ratio="1:1",
+                error_type=None,
+                error_detail=None,
+                started_at=now,
+                completed_at=now,
+            )
+        )
+        repo.link_operation_asset(
+            operation_id=op1_id,
+            asset_id=asset_id,
+            role=OperationAssetRole.OUTPUT,
+            position=0,
+        )
+
+        # Insert op 2
+        op2_id = "op-2"
+        repo.insert_operation(
+            OperationRecord(
+                id=op2_id,
+                profile_name="tester",
+                flow_project_id="proj-op",
+                command="image",
+                mode=OperationKind.T2I,
+                status=OperationStatus.SUCCEEDED,
+                flow_operation_id="op2",
+                flow_batch_id=None,
+                prompt="Second prompt",
+                prompt_hash=None,
+                prompt_redacted=False,
+                model="test-model",
+                aspect_ratio="1:1",
+                error_type=None,
+                error_detail=None,
+                started_at=now,
+                completed_at=now,
+            )
+        )
+        repo.link_operation_asset(
+            operation_id=op2_id,
+            asset_id=asset_id,
+            role=OperationAssetRole.OUTPUT,
+            position=0,
+        )
+
+    # 1. Aggregated query
+    rows = list_images(db_path=db, profile=None, limit=20, offset=0)
+    assert len(rows) == 1
+    assert rows[0].prompt in ("First prompt", "Second prompt")
+
+    # 2. All copies query
+    rows_all = list_images(db_path=db, profile=None, limit=20, offset=0, all_copies=True)
+    assert len(rows_all) == 1
+    assert rows_all[0].prompt in ("First prompt", "Second prompt")
+
+
+# ---------------------------------------------------------------------------
+# get_asset_prompt — #287 round 6 (picker search-hint tier)
+# ---------------------------------------------------------------------------
+
+
+def test_get_asset_prompt_by_media_id(seeded: Path) -> None:
+    """#287 round 6: the picker search-hint tier needs the asset's recorded
+    generation PROMPT (Flow's media search does not index UUIDs, but the tile
+    alt text carries the prompt). Resolved by flow_media_id."""
+    prompt = get_asset_prompt(db_path=seeded, media_id="img-media-alice-1-1")
+    assert prompt == "prompt for alice project 1 image 1"
+
+
+def test_get_asset_prompt_unknown_media_returns_none(seeded: Path) -> None:
+    assert get_asset_prompt(db_path=seeded, media_id="no-such-media") is None

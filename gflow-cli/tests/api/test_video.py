@@ -1,0 +1,444 @@
+"""Pure tests for video value objects."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from gflow_cli.api.video import (
+    MAX_REFERENCE_IMAGES,
+    Aspect,
+    GenerateVideoRequest,
+    Mode,
+    Tier,
+    VideoModel,
+    VideoResult,
+    VideoStatus,
+    media_name_from_generate_response,
+    operation_name_from_generate_response,
+    parse_video_status,
+    reference_cap_for,
+)
+
+
+class TestVideoModelEnum:
+    def test_from_cli_none_returns_none(self) -> None:
+        assert VideoModel.from_cli(None) is None
+
+    def test_from_cli_aliases(self) -> None:
+        assert VideoModel.from_cli("omni-flash") is VideoModel.OMNI_FLASH
+        assert VideoModel.from_cli("veo-fast") is VideoModel.VEO_3_1_FAST
+        assert VideoModel.from_cli("veo-quality") is VideoModel.VEO_3_1_QUALITY
+        assert VideoModel.from_cli("veo-lite") is VideoModel.VEO_3_1_LITE
+        assert VideoModel.from_cli("veo-lite-lp") is VideoModel.VEO_3_1_LITE_LOWER_PRIORITY
+
+    def test_from_cli_invalid_raises(self) -> None:
+        with pytest.raises(ValueError, match="Unknown video model"):
+            VideoModel.from_cli("sora")
+
+    def test_no_model_gates_the_i2v_end_frame(self) -> None:
+        """End-frame capability is no longer model-conditional (#626).
+
+        Every model now carries a start+end i2v pair, so the
+        ``supports_i2v_end_frame()`` predicate that used to exclude
+        ``OMNI_FLASH`` is gone rather than left as a constant ``True``. This
+        test fails if anyone reintroduces it — the right response to a real
+        future asymmetry is a fresh predicate with fresh wire evidence, not a
+        revival of the stale one.
+        """
+        assert not hasattr(VideoModel.OMNI_FLASH, "supports_i2v_end_frame")
+
+    def test_i2v_default_model_is_veo_lite(self) -> None:
+        from gflow_cli.api.video import I2V_DEFAULT_MODEL
+
+        assert I2V_DEFAULT_MODEL is VideoModel.VEO_3_1_LITE
+
+
+class TestVideoRequestNewFields:
+    def test_defaults(self) -> None:
+        req = GenerateVideoRequest(prompt="x")
+        assert req.model is None
+        assert req.duration is None
+        assert req.count == 1
+
+    def test_invalid_duration_rejected(self) -> None:
+        with pytest.raises(ValueError, match="duration must be"):
+            GenerateVideoRequest(prompt="x", duration=5)
+
+    def test_10s_requires_omni_flash(self) -> None:
+        with pytest.raises(ValueError, match="only available for omni_flash"):
+            GenerateVideoRequest(prompt="x", duration=10, model=VideoModel.VEO_3_1_FAST)
+        # omni_flash + 10s, and model-less 10s (default unknown), are both OK
+        GenerateVideoRequest(prompt="x", duration=10, model=VideoModel.OMNI_FLASH)
+        GenerateVideoRequest(prompt="x", duration=10)
+
+    def test_count_out_of_range_rejected(self) -> None:
+        with pytest.raises(ValueError, match="count must be"):
+            GenerateVideoRequest(prompt="x", count=5)
+        with pytest.raises(ValueError, match="count must be"):
+            GenerateVideoRequest(prompt="x", count=0)
+
+
+class TestAspectEnum:
+    def test_portrait_wire_value(self) -> None:
+        assert Aspect.PORTRAIT.wire() == "VIDEO_ASPECT_RATIO_PORTRAIT"
+
+    def test_landscape_wire_value(self) -> None:
+        assert Aspect.LANDSCAPE.wire() == "VIDEO_ASPECT_RATIO_LANDSCAPE"
+
+    def test_square_wire_value(self) -> None:
+        assert Aspect.SQUARE.wire() == "VIDEO_ASPECT_RATIO_SQUARE"
+
+    def test_from_cli_value(self) -> None:
+        assert Aspect.from_cli("9:16") == Aspect.PORTRAIT
+        assert Aspect.from_cli("16:9") == Aspect.LANDSCAPE
+        assert Aspect.from_cli("1:1") == Aspect.SQUARE
+
+    def test_from_cli_invalid_raises(self) -> None:
+        with pytest.raises(ValueError, match="3:2"):
+            Aspect.from_cli("3:2")
+
+
+class TestMode:
+    def test_has_r2v(self) -> None:
+        assert Mode.R2V == "r2v"
+
+    def test_three_modes(self) -> None:
+        assert {m.value for m in Mode} == {"t2v", "i2v", "r2v"}
+
+
+class TestGenerateVideoRequest:
+    def test_t2v_defaults(self) -> None:
+        req = GenerateVideoRequest(prompt="a calm forest at dawn")
+        assert req.mode is Mode.T2V
+        assert req.aspect is Aspect.PORTRAIT
+        assert req.tier is Tier.FAST
+        assert req.start_image is None
+        assert req.reference_images == ()
+
+    def test_empty_prompt_rejected(self) -> None:
+        with pytest.raises(ValueError, match="prompt must not be empty"):
+            GenerateVideoRequest(prompt="   ")
+
+    def test_t2v_must_not_carry_image_inputs(self) -> None:
+        with pytest.raises(ValueError, match="T2V request must not carry image inputs"):
+            GenerateVideoRequest(prompt="x", mode=Mode.T2V, start_image=Path("a.png"))
+
+    def test_i2v_requires_start_image(self) -> None:
+        with pytest.raises(ValueError, match="I2V request requires start_image"):
+            GenerateVideoRequest(prompt="x", mode=Mode.I2V)
+
+    def test_i2v_accepts_start_and_optional_end(self) -> None:
+        req = GenerateVideoRequest(
+            prompt="x", mode=Mode.I2V, start_image=Path("a.png"), end_image=Path("b.png")
+        )
+        assert req.start_image == Path("a.png")
+        assert req.end_image == Path("b.png")
+
+    def test_i2v_must_not_carry_reference_images(self) -> None:
+        with pytest.raises(ValueError, match="must not carry reference_images"):
+            GenerateVideoRequest(
+                prompt="x",
+                mode=Mode.I2V,
+                start_image=Path("a.png"),
+                reference_images=(Path("r.png"),),
+            )
+
+    def test_r2v_requires_a_reference_image(self) -> None:
+        with pytest.raises(ValueError, match="reference_images, ref_names, or reference_entities"):
+            GenerateVideoRequest(prompt="x", mode=Mode.R2V)
+
+    def test_r2v_must_not_carry_start_end(self) -> None:
+        with pytest.raises(ValueError, match="must not carry start/end"):
+            GenerateVideoRequest(
+                prompt="x",
+                mode=Mode.R2V,
+                reference_images=(Path("r.png"),),
+                start_image=Path("a.png"),
+            )
+
+    def test_too_many_reference_images_rejected(self) -> None:
+        too_many = tuple(Path(f"r{i}.png") for i in range(MAX_REFERENCE_IMAGES + 1))
+        with pytest.raises(ValueError, match="at most"):
+            GenerateVideoRequest(prompt="x", mode=Mode.R2V, reference_images=too_many)
+
+    def test_per_model_reference_cap(self) -> None:
+        refs1 = (Path("r0.png"),)
+        refs3 = tuple(Path(f"r{i}.png") for i in range(3))
+        refs4 = tuple(Path(f"r{i}.png") for i in range(4))
+        refs5 = tuple(Path(f"r{i}.png") for i in range(5))
+        refs7 = tuple(Path(f"r{i}.png") for i in range(7))
+        refs8 = tuple(Path(f"r{i}.png") for i in range(8))
+
+        # Veo lite/fast/lite_lp cap at 3 -> 4 refs rejected, 3 refs accepted.
+        for veo3 in (
+            VideoModel.VEO_3_1_LITE,
+            VideoModel.VEO_3_1_FAST,
+            VideoModel.VEO_3_1_LITE_LOWER_PRIORITY,
+        ):
+            with pytest.raises(ValueError, match="at most 3 reference image"):
+                GenerateVideoRequest(prompt="x", mode=Mode.R2V, model=veo3, reference_images=refs4)
+            # exactly at cap is fine
+            GenerateVideoRequest(prompt="x", mode=Mode.R2V, model=veo3, reference_images=refs3)
+
+        # Veo 3.1 Quality does NOT support R2V at all (cap=0) — any ref count rejected.
+        with pytest.raises(ValueError, match="does not support R2V"):
+            GenerateVideoRequest(
+                prompt="x",
+                mode=Mode.R2V,
+                model=VideoModel.VEO_3_1_QUALITY,
+                reference_images=refs1,
+            )
+
+        # omni_flash allows 7; 8 rejected (via the absolute ceiling), 7 accepted.
+        with pytest.raises(ValueError, match="at most 7 reference images"):
+            GenerateVideoRequest(
+                prompt="x",
+                mode=Mode.R2V,
+                model=VideoModel.OMNI_FLASH,
+                reference_images=refs8,
+            )
+        GenerateVideoRequest(
+            prompt="x", mode=Mode.R2V, model=VideoModel.OMNI_FLASH, reference_images=refs7
+        )
+
+        # model None -> only the absolute ceiling (7) applies; 5 is fine.
+        GenerateVideoRequest(prompt="x", mode=Mode.R2V, reference_images=refs5)
+
+    def test_reference_cap_for_helper(self) -> None:
+        assert reference_cap_for(VideoModel.OMNI_FLASH) == 7
+        assert reference_cap_for(VideoModel.VEO_3_1_LITE) == 3
+        assert reference_cap_for(VideoModel.VEO_3_1_FAST) == 3
+        assert reference_cap_for(VideoModel.VEO_3_1_LITE_LOWER_PRIORITY) == 3
+        assert reference_cap_for(VideoModel.VEO_3_1_QUALITY) == 0
+
+    def test_seed_range_enforced(self) -> None:
+        with pytest.raises(ValueError, match="seed out of range"):
+            GenerateVideoRequest(prompt="x", seed=-1)
+        GenerateVideoRequest(prompt="x", seed=0)  # boundary OK
+        GenerateVideoRequest(prompt="x", seed=2**31 - 1)  # boundary OK
+
+    def test_post_init_does_not_touch_the_filesystem(self) -> None:
+        # Structural validation only — a non-existent path must NOT raise.
+        GenerateVideoRequest(prompt="x", mode=Mode.I2V, start_image=Path("does/not/exist.png"))
+
+
+_REF_UUID = "d6f1927a-3eae-4626-bc90-9a6ea7637bab"
+
+
+class TestI2VFrameRefIds:
+    """#287: an in-project asset UUID can stand in for a local frame file."""
+
+    def test_i2v_satisfied_by_start_ref_id_alone(self) -> None:
+        req = GenerateVideoRequest(prompt="x", mode=Mode.I2V, start_image_ref_id=_REF_UUID)
+        assert req.start_image is None
+        assert req.start_image_ref_id == _REF_UUID
+
+    def test_end_ref_id_accepted(self) -> None:
+        req = GenerateVideoRequest(
+            prompt="x",
+            mode=Mode.I2V,
+            start_image=Path("a.png"),
+            end_image_ref_id=_REF_UUID,
+        )
+        assert req.end_image_ref_id == _REF_UUID
+
+    def test_ref_local_fallback_requires_matching_ref_id(self) -> None:
+        with pytest.raises(ValueError, match="start_image_ref_local_path requires"):
+            GenerateVideoRequest(
+                prompt="x",
+                mode=Mode.I2V,
+                start_image=Path("a.png"),
+                start_image_ref_local_path=Path("fallback.png"),
+            )
+
+    def test_ref_local_fallback_requires_checksum(self) -> None:
+        with pytest.raises(ValueError, match="start_image_ref_local_path requires"):
+            GenerateVideoRequest(
+                prompt="x",
+                mode=Mode.I2V,
+                start_image_ref_id=_REF_UUID,
+                start_image_ref_local_path=Path("fallback.png"),
+            )
+
+    def test_malformed_ref_id_rejected(self) -> None:
+        with pytest.raises(ValueError, match="not a valid media UUID"):
+            GenerateVideoRequest(prompt="x", mode=Mode.I2V, start_image_ref_id="not-a-uuid")
+
+    def test_start_file_and_ref_id_mutually_exclusive(self) -> None:
+        with pytest.raises(ValueError, match="at most one of"):
+            GenerateVideoRequest(
+                prompt="x",
+                mode=Mode.I2V,
+                start_image=Path("a.png"),
+                start_image_ref_id=_REF_UUID,
+            )
+
+    def test_t2v_must_not_carry_ref_ids(self) -> None:
+        with pytest.raises(ValueError, match="T2V request must not carry image inputs"):
+            GenerateVideoRequest(prompt="x", mode=Mode.T2V, start_image_ref_id=_REF_UUID)
+
+    def test_r2v_must_not_carry_ref_ids(self) -> None:
+        with pytest.raises(ValueError, match="must not carry start/end images"):
+            GenerateVideoRequest(
+                prompt="x",
+                mode=Mode.R2V,
+                ref_names=("n",),
+                end_image_ref_id=_REF_UUID,
+            )
+
+
+class TestVideoStatus:
+    def test_pending_is_not_terminal(self) -> None:
+        s = VideoStatus(media_id="m", status="MEDIA_GENERATION_STATUS_PENDING")
+        assert s.is_terminal is False
+        assert s.succeeded is False
+
+    def test_active_is_not_terminal(self) -> None:
+        s = VideoStatus(media_id="m", status="MEDIA_GENERATION_STATUS_ACTIVE")
+        assert s.is_terminal is False
+
+    def test_successful_is_terminal_and_succeeded(self) -> None:
+        s = VideoStatus(media_id="m", status="MEDIA_GENERATION_STATUS_SUCCESSFUL")
+        assert s.is_terminal is True
+        assert s.succeeded is True
+
+    def test_failed_is_terminal_not_succeeded(self) -> None:
+        s = VideoStatus(
+            media_id="m",
+            status="MEDIA_GENERATION_STATUS_FAILED",
+            failure_reasons=("IP_PROHIBITED",),
+            error_message="PUBLIC_ERROR_IP_INPUT_IMAGE",
+        )
+        assert s.is_terminal is True
+        assert s.succeeded is False
+        assert s.failure_reasons == ("IP_PROHIBITED",)
+        assert s.error_message == "PUBLIC_ERROR_IP_INPUT_IMAGE"
+
+
+_CAPTURES = Path(__file__).parent.parent.parent / "samples" / "captured"
+
+
+def _body(filename: str) -> dict:
+    """Load the response body the parsers consume from a committed capture.
+
+    NOTE: the capture sanitizer redacts media ids inconsistently — capture 02
+    uses `<UUID>`, captures 08/09/10/11 use `<GENERATED_MEDIA_ID>`. The
+    assertions below match each file's actual token; a re-sanitization that
+    unifies them would require updating these expected values.
+    """
+    raw = json.loads((_CAPTURES / filename).read_text(encoding="utf-8"))
+    return raw["response_body_parsed"]
+
+
+class TestMediaNameFromGenerateResponse:
+    def test_t2v_capture(self) -> None:
+        name = media_name_from_generate_response(_body("02_batchAsyncGenerateVideoText.json"))
+        assert name == "<UUID>"
+
+    def test_i2v_capture(self) -> None:
+        name = media_name_from_generate_response(
+            _body("08_batchAsyncGenerateVideoStartAndEndImage.json")
+        )
+        assert name == "<GENERATED_MEDIA_ID>"
+
+    def test_r2v_capture(self) -> None:
+        name = media_name_from_generate_response(
+            _body("09_batchAsyncGenerateVideoReferenceImages.json")
+        )
+        assert name == "<GENERATED_MEDIA_ID>"
+
+    def test_missing_media_raises(self) -> None:
+        with pytest.raises(ValueError, match="no media"):
+            media_name_from_generate_response({"workflows": []})
+
+
+class TestParseVideoStatus:
+    def test_successful_capture(self) -> None:
+        s = parse_video_status(
+            _body("10_batchCheckAsyncVideoGenerationStatus_successful.json"),
+            media_id="<GENERATED_MEDIA_ID>",
+        )
+        assert s.status == "MEDIA_GENERATION_STATUS_SUCCESSFUL"
+        assert s.is_terminal is True
+        assert s.succeeded is True
+        assert s.failure_reasons == ()
+        assert s.error_message is None
+
+    def test_failed_capture(self) -> None:
+        s = parse_video_status(
+            _body("11_batchCheckAsyncVideoGenerationStatus_failed.json"),
+            media_id="<GENERATED_MEDIA_ID>",
+        )
+        assert s.status == "MEDIA_GENERATION_STATUS_FAILED"
+        assert s.is_terminal is True
+        assert s.succeeded is False
+        assert s.failure_reasons == ("IP_PROHIBITED",)
+        assert s.error_message == "PUBLIC_ERROR_IP_INPUT_IMAGE"
+
+    def test_media_id_not_in_response_raises(self) -> None:
+        with pytest.raises(ValueError, match="not found"):
+            parse_video_status(
+                _body("10_batchCheckAsyncVideoGenerationStatus_successful.json"),
+                media_id="no-such-id",
+            )
+
+    def test_malformed_status_raises(self) -> None:
+        with pytest.raises(ValueError, match="mediaGenerationStatus"):
+            parse_video_status({"media": [{"name": "m", "mediaMetadata": {}}]}, media_id="m")
+
+
+class TestOperationNameFromGenerateResponse:
+    def test_reads_operation_name(self) -> None:
+        body = {
+            "media": [{"name": "media-1"}],
+            "operations": [{"operation": {"name": "media-1"}}],
+        }
+        assert operation_name_from_generate_response(body) == "media-1"
+
+    def test_matches_current_media_id_in_fixture(self) -> None:
+        body = {
+            "media": [{"name": "media-1"}],
+            "operations": [{"operation": {"name": "media-1"}}],
+        }
+        assert operation_name_from_generate_response(body) == body["media"][0]["name"]
+
+    def test_returns_none_when_operations_absent(self) -> None:
+        assert operation_name_from_generate_response({"media": [{"name": "m"}]}) is None
+
+    def test_returns_none_when_operations_empty(self) -> None:
+        assert operation_name_from_generate_response({"operations": []}) is None
+
+    def test_real_t2v_capture_extracts_operation_name(self) -> None:
+        """Regression lock: a real classic-veo capture must still yield a
+        non-None operation name. Root-caused 2026-07-21 — flow_operation_id
+        is best-effort/optional (None is a legitimate outcome when the
+        generate response omits operations[0].operation.name), but when the
+        field IS present the parser must keep extracting it correctly.
+        """
+        name = operation_name_from_generate_response(_body("02_batchAsyncGenerateVideoText.json"))
+        assert name == "<UUID>"
+
+
+class TestVideoResult:
+    def test_video_result_holds_fields(self) -> None:
+        status = VideoStatus(media_id="abc-123", status="MEDIA_GENERATION_STATUS_SUCCESSFUL")
+        result = VideoResult(status=status, local_path=Path("/tmp/abc-123.mp4"))
+        assert result.status is status
+        assert result.local_path == Path("/tmp/abc-123.mp4")
+
+    def test_video_result_no_path_when_failed(self) -> None:
+        status = VideoStatus(media_id="abc-123", status="MEDIA_GENERATION_STATUS_FAILED")
+        result = VideoResult(status=status, local_path=None)
+        assert result.local_path is None
+        assert not result.status.succeeded
+
+    def test_video_result_is_frozen(self) -> None:
+        from dataclasses import FrozenInstanceError
+
+        status = VideoStatus(media_id="x", status="MEDIA_GENERATION_STATUS_SUCCESSFUL")
+        result = VideoResult(status=status, local_path=None)
+        with pytest.raises(FrozenInstanceError):
+            result.local_path = Path("/tmp/other.mp4")  # type: ignore[misc]

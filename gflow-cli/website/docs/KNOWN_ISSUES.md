@@ -1,0 +1,1699 @@
+# Known Issues
+
+Living list of behaviour that's broken, surprising, or limited by design — alongside workarounds and a pointer to the issue / version where each is tracked or resolved.
+
+> Pair with [CHANGELOG.md](CHANGELOG.md) (what shipped per version) and [DISCLAIMER.md](DISCLAIMER.md) (legal/scope limits).
+
+## Conventions
+
+- **Status: Open** — still happens in latest release. Workaround listed.
+- **Status: Mitigated** — partial fix in place; full resolution tracked.
+- **Status: Resolved** — fixed in version `X.Y.Z`; row kept here for searchability.
+
+---
+
+## Open
+
+### Flow is migrating to `flow.google.com`; generation coverage is partial but includes images
+
+- **Status:** Open (partially resolved) · **Severity:** High for unported forms · **Affected:** on accounts the rollout has reached, `gflow video t2v`, local-file `video i2v` / `r2v`, `gflow image t2i`, and local-file `gflow image i2i` now run on the migrated host. Image mode supports Nano Banana 2 / Pro, the four aspect ratios its radiogroup was enumerated with (16:9, 4:3, 1:1, 9:16), and count 1–4; `3:4` had no radio in that enumeration and is refused before submit rather than reported as selector drift. Image refs by UUID, `@Name` / `--reference-entity`, Agent instructions, Imagen 4, video end frames, video refs by UUID/name, scenes, extend, instructions and tools are not ported yet and fail before submit. **`character` is NOT in that list any more** — `character create` and `character list` work on the migrated host. Of the remainder, only the i2v-by-UUID case rests on a positive observation of absence (the Frames picker tiles carry no media id); `scenes`, `extend`, `instructions` and `tools` remain *unported by gflow*, never proven impossible on the host.
+- **Tracked:** [#639](https://github.com/ffroliva/gflow-cli/issues/639) · Reported 2026-09-02 against 0.59.0, 0.62.1, 0.63.0 and 0.65.0
+- **Confirmed live 2026-09-03 on a second, independent account** (`ffroliva`) — see [LIVE_VERIFICATION_v0.66.0](https://github.com/ffroliva/gflow-cli/blob/main/docs/LIVE_VERIFICATION_v0.66.0.md). A read-only probe of the migrated origin measured `i_total: 0`, reproducing the reporter's central measurement.
+- **`--reference-entity` was refused on `r2v` but not on `t2v`** ([#716](https://github.com/ffroliva/gflow-cli/issues/716), fixed in v0.71.0): the "not ported, exit 36" refusal above sat inside the r2v branch of the routing gate, so a `t2v` request carrying a character entity returned from that gate without its entities ever being inspected — and nothing downstream attaches one on this host. The generation was **submitted and billed** with the entity silently dropped, returning a plausible clip of the wrong person. The check is now mode-independent and ahead of every early return. If you ran `gflow video t2v @Name …` or `--reference-entity` on a moved account before this fix, the identity in those clips was never bound.
+- **The migrated composer image path is now driven** ([#692](https://github.com/ffroliva/gflow-cli/issues/692)): the first probe established a hit-testable Image mode; the 2026-09-08 follow-up captured real T2I and local-file I2I submissions on `ogiZ0b`, including page-owned reCAPTCHA, upload ids, response records and signed JPEG downloads. See [the submit-wire spike](https://github.com/ffroliva/gflow-cli/blob/main/docs/superpowers/spikes/2026-09-08-migrated-image-submit-wire.md).
+- **Image commands on a moved account** ([#673](https://github.com/ffroliva/gflow-cli/issues/673), fixed in v0.69.0): through v0.68.0 `image t2i` / `i2i` (and `upscale`, `extend`) died with exit 1 `RecaptchaError` within seconds, before any submit, instead of the exit 36 above, because the labs client minted the reCAPTCHA token on the `flow.google.com` project grid before any migration guard ran. The guard now runs at the mint. If you still see a `RecaptchaError` on a moved account right after `auth login`, that is the labs logged-out landing page from the [#644](https://github.com/ffroliva/gflow-cli/issues/644) cookie harvest, not this.
+
+Google is moving Flow off Labs onto its own origin. On a migrated page load,
+`https://labs.google/fx/tools/flow/project/<id>` redirects to
+`https://flow.google.com/project/<id>` and serves a rewritten frontend that
+contains **zero `<i>` elements**. Every gflow selector anchors on Material
+Symbols ligatures (`i.google-symbols:text-is(...)`), so cohort detection and
+every mode control miss at once.
+
+**v0.66.0 read the rollout as flapping per page load** — the same account, profile
+and project landing on the old host on one navigation and the migrated one on the
+next, minutes apart. Those two captures straddled the account's one-time switch
+(see the 2026-09-04 note under Workaround). Measured on one account ~35 minutes apart:
+
+```
+old host       labs.google/fx/<locale>/tools/flow/...   i=55  i.google-symbols=49  crop_* present   -> exit 0
+migrated host  flow.google.com/project/...              i=0   i.google-symbols=0   crop_* absent    -> exit 36
+```
+
+Note the migrated URL **drops `/fx/tools/flow` entirely** — it is `/project/<id>`, not
+`/fx/<locale>/tools/flow/project/<id>`. Any host gate written as a substring test on
+`labs.google` could never have matched it.
+
+This is **not** selector rot, not [#493](https://github.com/ffroliva/gflow-cli/issues/493),
+and not the agentic cohort — the agentic indicators are absent too. It is a
+different origin serving different markup.
+
+**What works now — generation on the migrated host.** `gflow video t2v … --project <id>`
+drives the migrated editor directly (settings through its option groups, prompt,
+submit, then it observes the app's own `batchexecute` status replies and downloads
+the clip). Two real clips were generated this way on 2026-09-05 — spike
+`docs/superpowers/spikes/2026-09-05-migrated-host-wire-protocol.md`. Routing
+(`GFLOW_CLI_FLOW_HOST=auto`): flow.google.com is the **default** host for that
+command on every account — moved or not; `flow.google.com` forces it for
+everything, and `labs.google` switches the migrated composer off. Limits today: `--project` is required (project creation from the
+migrated editor is not ported), and `t2v`, `i2v` from a local `--initial-frame` (no end frame,
+no UUID/`@Name` frame — the migrated Frames picker exposes no media id in its DOM, so a frame is
+found by file name after gflow uploads it through the editor), and `r2v` from local `--ref` files
+(see the next paragraph), plus `image t2i` and local-file `image i2i` — unsupported
+forms still exit 36.
+
+**`r2v` from local `--ref` files also runs there (2026-09-06).** Each file is uploaded
+through the same editor toolbar path i2v uses — so the app's own `maseQ` reply names the
+media id — and then attached as an `@` **mention** in the prompt rather than a chip slot.
+Two details are load-bearing: the Ingredients submit is rpcid **`MZZa6b`** (t2v is
+`YhhmEf`, i2v `eb1hJf`), and a mention is committed by **Enter** — a typed query alone
+leaves the picker open and inserts nothing. The submit body is asserted to carry every
+uploaded id, and a run whose references have not all attached is refused **before**
+submit, because the failure mode is a full-price clip with none of them on it.
+References by `@Name` and character entities stay on labs, for the same reason a frame by
+UUID does: the picker exposes no media id to anchor on. Capture:
+[2026-09-05-migrated-r2v-attach-surface](https://github.com/ffroliva/gflow-cli/blob/main/docs/superpowers/spikes/2026-09-05-migrated-r2v-attach-surface.md).
+
+**Images also run there (2026-09-08).** The driver selects Image mode, Nano Banana 2
+or Pro, any supported aspect and count 1–4, then observes the page's own synchronous
+`ogiZ0b` reply. Local I2I files use the existing `maseQ` upload and mention path; every
+uploaded id must appear in the submit body before the result is trusted. UUID/entity
+references, Agent instructions, and Imagen 4 remain pre-submit refusals on this host.
+
+**Models on the migrated host.** Its picker is driven for every tier the account's
+menu actually renders, `veo-lite-lp` included — matched by the `[Lower Priority]`
+tag alone, exactly as on labs.google. That entry was first captured on 2026-09-05
+(`Veo 3.1 - Lite [Lower Priority]`, on an account whose picker was already defaulted
+to it); matching stays on the tag, which survives Flow throttling a different tier. A tier whose matcher hits more than
+one live entry is refused (exit 11) naming both, rather than bound by DOM order
+([#539](https://github.com/ffroliva/gflow-cli/issues/539)). `veo-lite-lp` is
+deliberately **not** a routing trigger: an account Flow has not moved keeps the
+labs driver for it, since pulling a request onto the new host for a tier no
+capture has seen would trade a working driver for an unverified one.
+
+**Workaround for the rest:** none client-side. The handoff
+is a per-account setting the labs.google app applies on every load (measured
+5/5 and 7/7 with no flap, 2026-09-04 — spike
+`docs/superpowers/spikes/2026-09-04-migrated-host-handoff-mechanism.md`), so
+once the account is flagged, re-running will not land the old frontend. Earlier text here said the rollout
+"flaps" and told you to retry; that observation straddled the account's one-time
+switch and is withdrawn. The REST surface (`gflow project list`, `gflow data …`)
+is unaffected; `gflow credits` is **not** — its token comes from `labs.google`, which mints none for a moved account ([#795](https://github.com/ffroliva/gflow-cli/issues/795), open; see the quota entry below). Automated callers now receive `retryable: false` so retry loops
+stop instead of burning a doomed attempt each time.
+
+**What gflow does today for the rest of the matrix:** recognises the migrated
+origin — `page.url` is re-checked at every point the run is about to spend time,
+which Playwright updates in the same tick as the hand-off navigation — and fails
+with the distinct, non-retryable exit 36 instead of the misleading
+`UiSelectorDriftError` (exit 23, "file a selector bug"). `_check_logged_in` also
+accepts the migrated host, so a migrated load is no longer misread as a
+logged-out session. The generation forms listed above and characters are driven;
+scenes, extend, instructions, tools, project creation, and the named reference/model
+variants are the remaining work
+tracked here — no retry helps for those until each is ported.
+
+> **v0.66.1's fast-fail did not fire in the field, and v0.66.2 is the correction.**
+> The guard read `page.url` once, at `get_ui_driver` entry — before the hop to
+> `flow.google.com` had landed, because `project_editor_url` only builds
+> `labs.google` URLs and the redirect arrives *after* `page.goto` returns.
+> Measured by the reporter on three consecutive v0.66.1 runs: exit 36 at **57.0 /
+> 57.1 / 58.3 s**, through the slow selector-probe path. v0.66.2 re-checks the host
+> at the points the run already blocks, so the abort costs the old host nothing and
+> lands as soon as the redirect is observable. The same release stops a
+> `NOT_REDIRECTED` locale cache from disabling the `<html lang>` recovery (#643),
+> which had made that state unrecoverable on exactly the profiles it was written
+> for.
+
+---
+
+### A Veo extend segment is 7 seconds, not the 8 Flow advertises — so concat pads a frozen second
+
+- **Status:** Open · **Severity:** Medium (audible/visible on every internal seam of a chained extend) · **Affected:** `gflow video extend -n >1` with `-o`, and any scene mixing extend segments
+- **Discovered:** 2026-09-01, by live verification of the extend feature. Offline tests could not have found it.
+
+**What happens.** `gflow video extend ... -n 2 -o out.mp4` produces a file whose
+audio drops to digital silence (−91 dB) for exactly one second before each
+internal seam, over a **frozen video frame**. The seam itself is clean; the dead
+second sits immediately before it.
+
+**Measured.** In a 3-clip render (original + 2 extensions), per-second mean volume:
+
+```
+ 7s -28.8   8s -26.4      <- original -> extension seam: continuous
+14s -29.1  15s -75.1  16s -33.9   <- extension -> extension seam: 1s dropout
+```
+
+Finer slices put the silence at 15.00–15.99s exactly. Reproduced independently on
+a second render made days earlier from different prompts (14s −22.4, **15s −70.1**,
+16s −23.9), so it is systematic, not a one-off.
+
+**Root cause.** The extension media is **7.000000 seconds** — both video and audio
+streams, confirmed by `ffprobe` on the downloaded clip. But:
+
+- the capability listing advertises `videoLengthSeconds: 8` for
+  `veo_3_1_extension_lite`, and
+- `getSceneWorkflows` reports `total_duration=8.0`, `end=8.0` for that clip.
+
+`ConcatInput` passes those metadata values through verbatim, so Flow's
+server-side concat stretches a 7s clip into an 8s slot by holding the last frame
+and muting. The final segment escapes it only because the render ends before its
+padding (23.02s for 3 clips, not 24s).
+
+**Why it matters more than it looks.** A freeze-hold is the specific failure the
+Compiled Growth parable runbook forbids — *"NEVER pad by freeze-holding a frame —
+reads as 'video stuck'"* — and that pipeline is the named consumer for extend.
+An N-segment chain has N−1 of these.
+
+**Not yet established** (do not fix on a guess):
+
+- whether 7.0s is constant across extend models, aspects and tiers, or specific
+  to `veo_3_1_extension_lite`;
+- whether Flow's own UI renders the same padding (i.e. whether this is our
+  concat inputs or Flow's behaviour end-to-end);
+- whether any API field reports the real media duration, which is what a clean
+  fix needs — clamping `ConcatInput.end` to a hardcoded 7.0 would be a guess
+  dressed as a fix.
+
+**Workaround today.** Render without `-o` and trim in post, or accept the
+freeze-hold. Single-segment extends are unaffected.
+
+
+### An out-of-range Playwright silently wedges video generation
+
+- **Status:** Mitigated (v0.49.0 — upper-bounded dependency + fail-fast watchdog)
+- **Severity:** High (silent, multi-minute, indistinguishable from slowness) · **Affected:** any install that resolved a Playwright outside the tested range — most often `uv tool install <path>` from a local checkout
+
+`uv tool install <path>` **ignores `uv.lock`** and resolves from the
+`pyproject.toml` ranges, so a local/tool install could pick up a Playwright
+newer than anything this project has tested. Playwright ships the browser
+driver, so an untested minor is an untested product. Observed 2026-08-03: an
+install that resolved **1.62.0** against a project locked to **1.59.0** made
+every `gflow video i2v` run hang **silently** immediately after the frame
+upload — last log line `ui_automation_video.frame_attached`, browser alive, no
+error, no timeout, indefinitely. Reinstalling with the locked version fixed it
+on the first try.
+
+**Mitigation (two layers):**
+1. **Upper-bounded dependency.** `playwright>=1.59.0,<1.60.0` — an unpinned
+   install can no longer reach an untested minor. Raising it is a deliberate
+   act requiring a live-verified generation; offline tests and CI's
+   `resolve-drift` job (import-only) cannot see a driver-behaviour regression.
+2. **Fail-fast stage watchdog.** The prompt-submission stage runs under a named
+   wall-clock deadline. On expiry the run aborts **pre-submit** with
+   `TransportTimeoutError` (exit 8), a `stage_stalled` event, and a debug
+   screenshot — the error names the stage, prints your installed Playwright
+   version against the supported range, and gives the pinned reinstall command.
+   Nothing is submitted, so no credit is spent.
+
+**Workaround:** install from a local checkout with the lock carried explicitly —
+`uv tool install --force --with playwright==1.59.0 .` — and check what you have
+with `uv tool run --from gflow-cli python -c "import importlib.metadata as m; print(m.version('playwright'))"`.
+Installs from PyPI are unaffected.
+
+### Google's cookie-consent bar covers the composer on the migrated host — fixed in 0.73.1
+
+- **Status:** Fixed in 0.73.1 ([#780](https://github.com/ffroliva/gflow-cli/issues/780)) · **Affects:** `flow.google.com`, all versions through 0.73.0
+- **Severity:** High while it fires (every image and video run on that profile fails) · **Cost:** none — it fails before any submit, so no credits are spent
+
+Google's `glue` consent bar (`#glue-cookie-notification-bar-1`) is `position: fixed`
+at `z-index: 1000`, and Flow's composer is bottom-anchored in the same band. The bar
+therefore lands **on** the settings trigger *and* on the image submit button.
+Measured 2026-09-11 on the `ci-probe` profile: `elementFromPoint` over each returned
+the bar's label span in 5/5 rendered samples, on the same profile and project where
+the click had landed 3/3 the day before.
+
+**Who gets it:** anyone who has not yet dismissed it on that origin. The gate is a
+single key, `localStorage["glue.CookieNotificationBar"]` on `flow.google.com` — not a
+cookie, which is why no profile here carries `SOCS`. A clean browser profile reads the
+bar visible 4/4, and removing that key on a consented profile brings it straight back
+with both controls covered again. So it is the **default state**, and a stored
+dismissal is what removes it: every new gflow profile meets it on its first Flow load,
+and any profile whose stored dismissal Google resets meets it again — as `ci-probe` did
+within seventeen hours.
+
+The labs driver survives it by accident; `_bypass_onboarding` carries a text match on
+"Agree". The migrated driver had no equivalent.
+
+Through 0.73.0 the run fails at exit 23 with `it is covered by span` — the element on
+top is the bar's label, whose identity lives in an `id` the occluder allowlist drops,
+so the message named nothing actionable.
+
+0.73.1 dismisses the bar before the first click, choosing **reject** over accept
+(both clear it; only one answers a consent question for you), and teaches the
+post-mortem to climb to the nearest ancestor that names itself, so any bar that
+still refuses to go is reported as `div.glue-cookie-notification-bar`.
+
+**Workaround on 0.73.0 and earlier:** open that profile once in Chrome and dismiss
+the bar by hand. Consent persists in the profile.
+
+Evidence: [`docs/superpowers/spikes/2026-09-11-migrated-cookie-bar-blocks-the-composer.md`](https://github.com/ffroliva/gflow-cli/blob/main/docs/superpowers/spikes/2026-09-11-migrated-cookie-bar-blocks-the-composer.md).
+
+### One-time Flow banner/modal can cover the composer on first load
+
+- **Status:** Open ([#369](https://github.com/ffroliva/gflow-cli/issues/369))
+- **Severity:** Low (transient) · **Affected:** any UI-automation command on a profile that hasn't seen the banner yet
+
+A Flow-side one-time announcement banner/modal can overlay the composer and
+make the mode-switch / settings probes miss. It shows once per
+profile+cookie state, so it is gone on re-run and cannot be reproduced on
+demand. gflow does **not** guess a dismiss selector for unknown overlays
+(clicking unknown UI is riskier than failing). Since v0.43.0 the automatic
+incident bundle records the overlay's bounded geometry, `role`,
+`aria-modal`, `z-index`, `pointer-events`, and inner Material-Symbol
+ligatures (no raw text) plus a `sensitive/` screenshot — enough to write a
+targeted dismissal once the next occurrence is captured. **Workaround:**
+re-run the command; open the project once manually in Chrome to consume the
+banner.
+
+### Profile lock reported as "held by another process" with no obvious owner
+
+- **Status:** Resolved ([#370](https://github.com/ffroliva/gflow-cli/issues/370)) · remediation message clarified
+- **Severity:** Low (by design; fails closed — never corrupts) · **Affected:** `ProfileLease` acquisition (exit 11)
+
+`ProfileLockedError` can surface when no `chrome.exe` / `gflow` process is
+obvious. This is **working as intended, not a stale-file bug.** The profile
+lock is a kernel *advisory* byte-range lock, which the OS releases the instant
+its holder dies — so a leftover lock *file* can never block acquisition. If
+`acquire` is blocked, a **live** process genuinely holds it, most often a
+`python.exe` (a prior gflow run, or a pytest child that outlived its shell)
+that a scan for `chrome.exe` misses. gflow deliberately never auto-deletes a
+lock file or kills a recorded PID from metadata: an unlink→new-inode race could
+put two browsers on one profile — the exact corruption the lease exists to
+prevent. Since v0.43.0 contention reports the recorded owner's PID and observed
+start time locally (metadata starts at offset 1 so Windows contenders can read
+it while byte 0 is kernel-locked), and the remediation message now names the
+live-owner reality and tells you to just retry when nothing is running.
+**Workaround:** close the process at the PID the error prints
+(`Get-Process -Id <pid>` / `ps -p <pid>`, then `Stop-Process -Id <pid>` /
+`kill <pid>`), or use a different `--profile`.
+
+### Unexplained image-generation HTTP 400 (observed live 2026-07-22)
+
+- **Status:** Open (no issue yet — evidence-gathering)
+- **Severity:** Low (single occurrence) · **Affected:** `image t2i` wire path
+
+One live `batchGenerateImages` call returned an HTTP 400 that was neither a
+content-safety rejection nor a known wire shape; the retry succeeded. Root
+cause unidentified and **not** claimed fixed by v0.43.0. A 400 that resolves
+on retry writes **no** incident bundle (successful commands capture nothing).
+The diagnostics help only when such a 400 *terminates* the command as a
+captured failure (e.g. a `WireFormatError`): its incident bundle's
+`network.json` then carries allowlisted discovery evidence for the failed
+request (numeric error code, status enum, known-key booleans, unknown-key
+count, message length — never the raw body), which is the evidence this entry
+is waiting on. **Workaround:** retry; the failure has not recurred.
+
+### Flow's `uploadImage` endpoint rejects some JPEGs with HTTP 400 (metadata-sensitive)
+
+- **Status:** Open ([#287](https://github.com/ffroliva/gflow-cli/issues/287))
+- **Severity:** Low (typed + remediable) · **Affected:** i2v frame / reference uploads
+
+Observed live 2026-07-11: one JPEG was rejected with HTTP 400 while
+byte-identical-format siblings uploaded fine; re-encoding with
+`ffmpeg -q:v 2 -map_metadata -1` fixed it, implicating a metadata segment.
+Since #290 the rejection raises `MediaUploadRejectedError` (exit 27) with that
+remediation instead of a generic "Unexpected error." (exit 1). **Workaround:**
+re-encode the file, or reference the already-in-project asset by media UUID
+(`--initial-frame <UUID> --project <id>`). Root cause of Flow's metadata
+sensitivity is unidentified.
+
+### i2v frame-slot picker selection by UUID — RESOLVED live 2026-07-11
+
+- **Status:** **Verified live** ([#287](https://github.com/ffroliva/gflow-cli/issues/287) / PR [#290](https://github.com/ffroliva/gflow-cli/pull/290))
+- **Affected:** `gflow video i2v --initial-frame/--end-frame <UUID>`
+
+#290 routes i2v frame slots through `_select_existing_asset` (the UUID picker
+live-proven in the **Add-Media** dialog: v0.26.0 i2i-by-UUID, #282 scroll
+fixes). The **frame-slot** dialog carried a negative prior — #237's
+name-search there never surfaced generated media (v0.25.0 rework) — but the
+thumbnail-URL tile match succeeds where name search failed. Live evidence
+(2026-07-11, my-profile): `frame_ref_attached {slot: Start}` → wire capture on
+`batchAsyncGenerateVideoStartImage` with the asset's `startImage` bound →
+SUCCESSFUL 720×1280 mp4; **zero** `image_uploaded` events (no duplicate
+upload). Negative check: a foreign UUID exits 9 pre-generation with a
+`debug_frame_ref_miss_start.png` screenshot. Caveat that stands: the asset's
+project must be entered via `--project`, and projects that open in the
+full-page media-library UI (#174) can fail earlier at `mode_switch_trigger`.
+
+> **Superseded (v0.58.0, [#529](https://github.com/ffroliva/gflow-cli/issues/529)):**
+> the scroll-tier/UUID-search picker mechanics described above are gone. Frame
+> and image UUIDs now resolve through the catalog's recorded Flow
+> `display_name` (name search → exact UUID-in-thumbnail tile), with an
+> integrity-verified local-file upload as the only fallback. This entry is
+> retained as the historical record of the #287-era behavior.
+
+### Fresh generations may record without a `display_name` (async Flow caption)
+
+- **Status:** Mitigated — remedies shipped via [#543](https://github.com/ffroliva/gflow-cli/issues/543) and [#542](https://github.com/ffroliva/gflow-cli/issues/542)
+- **Affected:** UUID `--ref` / frame references to *just-generated* assets (v0.58.0+)
+
+Flow computes an asset's caption (`displayName`) asynchronously server-side, so
+a generation's response occasionally lacks it and the recorder correctly
+stores no name (observed live 2026-08-16 during the r2v e2e). Such rows skip
+the picker-selection path and use the integrity-verified local-file upload
+fallback instead — correct but a duplicate upload. Also by design, rows
+recorded before v0.58.0 and all rows under
+`GFLOW_CLI_HISTORY_PROMPTS=redacted` have no stored name. **Remedies:**
+`gflow data sync --names` (#543) backfills names credit-free from the Flow
+listing endpoint (privacy-gated to `store` history mode), and `gflow doctor`
+(#542) surfaces the affected-row count. Freshly generated rows whose caption
+has not landed yet stay nameless until the next sync sweep.
+
+### Video duration control is absent on some account cohorts
+
+- **Status:** Mitigated — fail-fast shipped in
+  [#289](https://github.com/ffroliva/gflow-cli/pull/289).
+  [#288](https://github.com/ffroliva/gflow-cli/issues/288) and
+  [#451](https://github.com/ffroliva/gflow-cli/issues/451) are closed; the
+  Flow-side behaviour is unresolved and untracked upstream. gflow's own static
+  gate was relaxed in [#650](https://github.com/ffroliva/gflow-cli/pull/650).
+- **Severity:** Medium · **Affected:** `gflow video` with an explicit
+  `--duration` (3/3 miss on a live 2026-07-11 run; re-confirmed by a $0
+  capability capture 2026-09-03)
+
+**Workaround:** omit `--duration` and accept Flow's default clip length.
+
+**What actually happens today.** gflow accepts `--duration 4`, `6` or `8` on the
+Veo 3.1 models and `10` on `omni-flash` only — the CLI no longer refuses a
+duration it cannot know your account supports. What it still cannot do is tell
+your cohort apart before opening the browser, so on an account that renders no
+duration row the run reaches Flow's settings popover and fails there — on the
+labs driver as `UiSelectorDriftError` (exit 23) with a `debug_no_duration_tab.png`
+screenshot, on the migrated `flow.google.com` host as `ConfigurationError` (exit 11)
+naming the duration axis (the maintainer cohort renders the row for Omni 1.1 Flash
+only there, measured 2026-09-05).
+That abort is **pre-submit**, so no credits are spent — live-verified 2026-07-11
+on the my-profile profile.
+
+**Root cause (confirmed live 2026-07-11, screenshot evidence on #288): the
+duration control is ABSENT from this cohort's settings popover** — the panel
+renders mode tabs (Imagem/Video), sub-mode (Frames/Elementos), aspect
+(9:16/16:9), count (1x–x4; labels renamed to xN since — see #404), and the
+model dropdown (Veo 3.1 - Lite), and nothing else. The earlier locale hypothesis
+is refuted: the UI renders in Portuguese and the sibling count tabs (`1x`/`x2`)
+match fine; there is simply no duration row to click.
+
+**Updated 2026-09-04 — it is a cohort difference, not a removal.** A third
+profile on the *same* `labs.google` frontend renders `4s/6s/8s` on all three
+selectable Veo 3.1 models, at different credit prices, in a credit-free capture
+whose count tabs came back on every model. (`veo_3_1_lite_lower_priority` missed
+its picker, so it is unmeasured either way.) Some accounts have the control, some
+do not; the cohort key — region, account age, experiment bucket — is unknown.
+
+Because the gate is a static per-model table rather than a read of your session,
+gflow cannot express that difference: it now allows `4/6/8` on every Veo 3.1
+model, and an account without the control discovers this in the browser rather
+than at the CLI edge. Trading an instant, wrong rejection for a slower, correct
+attempt was the deliberate call in #650. A session-level capability probe would
+remove the trade entirely and nobody has written one.
+
+**Reporting.** If Flow's UI shows a duration row for a Veo model on your account,
+that is useful — it narrows the cohort key. Attach the exact `--model` /
+`--duration` invocation and the error text; a `--model omni-flash` run
+additionally yields the probe name and `debug_no_duration_tab.png`. No tokens or
+signed URLs.
+
+### macOS: generation runs logged-out → HTTP 401, even with `--browser chrome`
+
+- **Status:** **RESOLVED in v0.23.0** ([#222](https://github.com/ffroliva/gflow-cli/issues/222),
+  fixed by [#230](https://github.com/ffroliva/gflow-cli/pull/230), @gunalak)
+- **Severity:** High · **Affected:** all `gflow` generation on **macOS** with a
+  `chrome`-strategy profile; Windows was unaffected
+
+On macOS, generation calls failed with **HTTP 401** (`AuthExpiredError` at
+`project.createProject`) on a profile that `gflow auth login` and verification
+accepted. Two corrections fixed it (verified end-to-end on macOS Apple Silicon):
+
+1. **Cookie-read bug (unconditional).** The Flow cookie snapshot read the jar via
+   `ctx.cookies(["https://labs.google"])`, whose path-`/` filter silently dropped
+   the `/fx`-scoped `__Secure-next-auth.session-token`. Now the full jar is read
+   and filtered by domain, so the session token is captured.
+2. **macOS headed-context decrypt (intermittent).** When the headed generation
+   context can't decrypt the on-disk store, the session is seeded from a snapshot
+   captured **pre-launch** via the working `--password-store=basic` reader. No-op on
+   Windows and on runs where the context decrypts natively.
+
+Evidence: [LIVE_VERIFICATION_v0.23.0](https://github.com/ffroliva/gflow-cli/blob/main/docs/LIVE_VERIFICATION_v0.23.0.md).
+
+### Expanded chat sidebar left the composer unrecoverable (exit 23)
+
+- **Status:** **Resolved** in v0.60.0 — fixed and A/B-verified live;
+  tracked in [#493](https://github.com/ffroliva/gflow-cli/issues/493)
+- **Severity:** High · **Affected:** `gflow image` / `gflow video` generation on
+  accounts whose chat sidebar lacks the `edit_square` affordance, any locale
+
+Reported 2026-08-13 (macOS, v0.53.1 and v0.55.0) as an unrecognized "third
+editor variant": frame-slot buttons ("Inicial"/"Final") on the composer next to
+an "Agente" pill, and **no** classic `crop_*` settings button.
+
+**Root cause (2026-08-14, reproduced live at zero credits):** there is no third
+variant. Those are stock classic-composer features — "Inicial"/"Final" are the
+**Frames** sub-mode's Start/End slots, and the Agent pill sits alongside the
+classic popover. The real trigger is Flow's **expanded chat sidebar**, which
+removes the classic composer *entirely*:
+
+```
+in sidebar state ->  crop_* triggers = 0    Agent pill = 0
+```
+
+One state, both reported symptoms. It also explains the exit code: with no
+agentic indicator on screen either, the cohort detector matches nothing, so the
+run fails as `UiSelectorDriftError` (**exit 23**) rather than the retryable
+exit-25 classification. The Portuguese UI was unrelated — the cascade is
+locale-invariant (ligature-keyed), re-confirmed on a pt-BR account.
+
+Recovery depended on a single selector scoped to the sidebar's `edit_square`
+("new session") affordance. On a cohort whose sidebar lacks that ligature the
+close button was never found, so the sidebar never closed, the composer never
+returned, and **every** run failed. `mode_control.ensure_media_mode` now falls
+back to an unscoped close, reached **only** from the demonstrably stuck state
+(no `crop_*` **and** no Agent pill) — safe there because the classic composer is
+gone, so nothing else a close button could belong to remains.
+
+Verified by an A/B on a real editor: with the scoped selector neutered the
+fallback recovers; with both neutered it does not. Two earlier hypotheses were
+tested and refuted first (a `crop_free` sub-mode trigger, and a composer
+hydration race) — see
+[the spike evidence](https://github.com/ffroliva/gflow-cli/blob/main/docs/superpowers/spikes/2026-08-14-video-model-capability-matrix.md).
+
+If you still hit exit 23 after upgrading, the run writes a PII-safe DOM
+signature to `diag_mode_switch_miss.json` (structural allowlist: ligature names
+and tag counts — no cookies, tokens, prompts, or page text; if absent, the
+incident bundle's `ui.json` carries the same data). Attach it to
+[#493](https://github.com/ffroliva/gflow-cli/issues/493) — that would indicate a
+state genuinely different from the sidebar one.
+
+### The referenceEntity guard covers browser-driven generation only
+
+- **Status:** **Open** — structural, tracked in
+  [#619](https://github.com/ffroliva/gflow-cli/issues/619)
+- **Severity:** Low today · **Affects:** any future direct-wire route that carries
+  `referenceEntities`
+
+`_intercept_reference_entities` strips character entities the caller did not request. As
+of v0.65.0 it **does** run — it never had before
+([#615](https://github.com/ffroliva/gflow-cli/issues/615)), and the fix is A/B-verified
+live (see
+[LIVE_VERIFICATION_reference_entity_guard](https://github.com/ffroliva/gflow-cli/blob/main/docs/LIVE_VERIFICATION_reference_entity_guard.md)).
+
+But it guards by registering a Playwright route handler, so it can only ever observe
+**browser-initiated** traffic. Every direct-wire route goes through `client._post_json`,
+which issues the request via `page.request.post` — Playwright's `APIRequestContext`. Those
+calls leave from the Python side using the browser context's cookies and never enter the
+browser's network stack, so **no route handler observes them, at any level**. This is
+Playwright behaving as designed, not a bug in our usage.
+
+**It does not bite today:** no direct-wire route currently sends `referenceEntities`. It is
+recorded because the coverage gap is invisible from the outside — the guard looks
+comprehensive and is not — and because it is the same fail-open shape as #615 one layer
+down. Any new direct-wire route that carries entity references would inherit the blind spot
+silently.
+
+**No workaround needed today.** If you are adding a direct-wire route that sends
+`referenceEntities`, filter them at the call site rather than relying on the guard.
+
+### Flow's new full-page media-library UI breaks entity attach (A/B rollout)
+
+- **Status:** **Open** — Flow-side staged rollout; tracked in
+  [#174](https://github.com/ffroliva/gflow-cli/issues/174)
+- **Severity:** High · **Affects:** `gflow image t2i --reference-entity` and
+  movie R2V entity attach on accounts that received the new UI, any locale
+
+Flow is A/B-rolling a new full-page media-library UI: clicking **Add Media**
+in the composer **navigates to a library page** (sidebar: All media /
+Characters / Scenes / Tools, with a floating quick-create composer) instead of
+opening the resource-picker dialog. On affected accounts the right-click
+include action still lands (a chip appears), **but the staged entity never
+reaches the submit** — the request carries no `referenceEntities`, so the
+submit backstops raise `WireFormatError` (**exit 7**) instead of silently
+returning a text-only generation as success.
+
+**Plain generation on this cohort now fails cleanly (#183).** When a project
+opens into this full-page library (or the agentic chat composer) there is no
+classic `crop_*` aspect/mode control, so `gflow image`/`gflow video` can't drive
+generation. Rather than the old opaque `UiSelectorDriftError` "file a bug", the
+mode-switch raise site now runs a runtime DOM scan and raises a clear, **retryable**
+`FlowAgentUiError` (**exit 25**, "this cohort flaps; retry shortly"), and dumps a
+DOM-signature diagnostics artifact (`diag_mode_switch_miss.json`; the incident
+bundle carries a screenshot under `sensitive/`) for reporting. The cohort is
+server-assigned per page load and flaps within ~12h, so a re-run often lands
+the classic UI. Driving the new UI directly is still out of scope.
+
+**How to tell which UI your account has:** in the Flow web editor, click
+**Add Media** — a small dialog means the old (working) UI; a navigation to a
+full-page library means the affected new UI.
+
+**Note:** the experiment appears to flap — the affected account observed on
+2026-06-12 00:13 was back on the old dialog UI by 12:48 the same day (variant
+probe, issue #174). If you hit exit 7 on entity attach, re-running later the
+same day may simply work again.
+
+**Workaround:** none yet on affected accounts — the attach gesture for the new
+UI is being reverse-engineered (recon plan in
+[docs/superpowers/plans/2026-06-12-issue-174-library-ui-attach/PLAN.md](https://github.com/ffroliva/gflow-cli/blob/main/docs/superpowers/plans/2026-06-12-issue-174-library-ui-attach/PLAN.md)).
+If you have a second profile/account still on the old UI, entity attach works
+there. Follow [#174](https://github.com/ffroliva/gflow-cli/issues/174) for
+status; please report whether your account shows the dialog or the full-page
+library (plus your locale) on that issue.
+
+### 4K image upscale requires a Flow Ultra subscription
+
+- **Status:** **Open** (by design — a Flow platform limit, not a gflow bug)
+- **Severity:** Low · **Affects:** `gflow image upscale --scale 4k` on non-Ultra accounts
+
+`gflow image upscale <mediaId> --scale 4k` returns **exit code 22**
+(`UpscaleUnavailableError`) on accounts below the Ultra tier — Flow gates 4K
+upscaling behind Ultra (the web UI shows an "Upgrade" button instead of a 4K
+option). The account tier is reported on the wire as `userPaygateTier` but is
+enforced server-side, so gflow cannot grant 4K locally.
+
+**Workaround:** use `--scale 2k` (available on all tiers), or upgrade the Flow
+account to Ultra. If you just upgraded, re-run `gflow auth login --profile <name>`
+to refresh the session before retrying 4K. Wire detail:
+[docs/IMAGE_UPSCALE_RECON.md](https://github.com/ffroliva/gflow-cli/blob/main/docs/IMAGE_UPSCALE_RECON.md) (#171).
+
+### Image generation returns HTTP 401 — `aisandbox-pa` generation endpoint
+
+- **Status:** **RESOLVED in v0.7.0** — moved to [Resolved](#resolved) section
+- **Severity:** ~~High~~ · **Was-affecting:** v0.6.0a6 and earlier
+
+> **Resolution (2026-05-20, v0.7.0):** the production `ui_automation` transport
+> drives the Flow web UI so Flow's own JS issues `batchGenerateImages` with
+> full auth context — bypassing the 401 on the `aisandbox-pa` HTTP path
+> entirely. Live-verified end-to-end on the `ffroliva` profile across four
+> aspect ratios (`9:16`, `16:9`, `1:1`, `4:3`); see
+> [`docs/LIVE_VERIFICATION_v0.7.0.md`](https://github.com/ffroliva/gflow-cli/blob/main/docs/LIVE_VERIFICATION_v0.7.0.md). The
+> 401 still hits the experimental HTTP transports
+> (`evaluate_fetch` / `bearer` / `sapisidhash`) under
+> `src/gflow_cli/api/transports/experimental/` — those are not the
+> production path. Historical detail preserved below for searchability.
+
+Image **generation** calls fail with HTTP 401 even on a profile that holds a
+fully verified Flow session. Discovered 2026-05-17 while building the e2e test
+suite, against a profile probed immediately after a successful
+`gflow auth login` (`auth_flow_session_verified`, `[OK] Flow session verified`).
+
+**What works vs. what fails — on the same freshly verified profile:**
+
+| Operation | Endpoint | Result |
+|---|---|---|
+| `verify_flow_session` | `labs.google/fx/api/auth/session` | ✅ `AUTHENTICATED` |
+| `FlowApiClient.health_check()` | Flow page context | ✅ `True` |
+| `create_project` | `labs.google/fx/api/trpc/project.createProject` | ✅ 200 |
+| **image generation** | `aisandbox-pa.googleapis.com` (private API) | ❌ **HTTP 401** |
+
+The `evaluate_fetch` transport receives a 401 on the generation request, runs
+its refresh path (`refresh_auth()` re-navigates to the Flow URL), retries once,
+gets 401 again, and raises:
+
+```
+AuthExpiredError: evaluate_fetch: HTTP 401 persisted after refresh — session expired
+```
+
+from `src/gflow_cli/api/transports/experimental/evaluate_fetch.py`
+(`_handle_response`). Call chain: `FlowApiClient.generate_image` /
+`generate_images_batch` → `_drive_image_generation` → `transport.generate_images`
+→ `_generate_images_inner` → `_handle_response`.
+
+**Distinct from issue #15.** Issue #15 was a 401 on `create_project` caused by
+the *profile* being signed in to Google but not the Flow app — fixed on the
+`fix/issue-15-i2v-bearer-auth` branch by verifying the real Flow session at
+login. That fix is confirmed working: `create_project` now succeeds. **This is
+a different 401** — it occurs on a profile that *is* verified and *can* create
+projects, specifically on the `aisandbox-pa.googleapis.com` generation
+endpoint, a different surface from the `labs.google` tRPC API.
+
+> **Related — L0 aisandbox Bearer auth (`feature/scene-add-clip`, 2026-05-31):**
+> the `aisandbox-pa` 401 is NOT a SAPISIDHASH issue — live verification proved
+> the real header is **`Authorization: Bearer ya29.<oauth>`** (the SPA's OAuth2
+> access token, fetched from `GET /fx/api/auth/session`). `page.request` 401s
+> because it sends cookies but not that token. The `gflow scene` groundwork now
+> fetches+caches the token and attaches the Bearer to the **`page.request` REST
+> path** (`_post_json` / `_patch_json`, host-scoped to `aisandbox-pa`) so
+> `uploadImage` / `scenes` / `commit` authenticate — see
+> [`docs/superpowers/plans/2026-05-31-l0-bearer-pivot.md`](https://github.com/ffroliva/gflow-cli/blob/main/docs/superpowers/plans/2026-05-31-l0-bearer-pivot.md).
+> **Live-verified 2026-05-31:** REST `uploadImage` returns 200
+> (`tests/e2e/test_aisandbox_auth_live.py`, credit-free).
+> **Liberating follow-up:** the same Bearer likely unlocks the `evaluate_fetch`
+> generation 401 above (and REST generation generally, modulo reCAPTCHA) —
+> deferred, not yet applied to that transport.
+
+**Scope.** The 401 affects every image-generation path uniformly on the
+`evaluate_fetch` transport (the live one): `test_e2e_single_image_gen` (C2,
+pre-existing), `test_e2e_generate_image_without_project_id` (PR #20,
+pre-existing), and the dropped `test_e2e_generate_images_batch_without_project_id`.
+It is **not** caused by recent test changes — `test_transports_e2e.py` is
+self-described scaffold ("Task D.1 scaffold; Task D.2 drives the real
+execution") that was never run green, and PR #20's e2e tests were merged
+without live execution. Whether the production CLI (`gflow image t2i` /
+`gflow video i2v`) is equally affected is **unconfirmed** — it uses the same
+`FlowApiClient` + transport, so it very likely is, but that has not been
+observed directly and should be checked first thing.
+
+**Experimental transports also broken.** The `bearer` and `sapisidhash`
+transports (`api/transports/experimental/`) fail before generation is even
+reached: `bearer` cannot intercept an OAuth token (`AuthExpiredError: bearer:
+failed to intercept Bearer token from Flow page`); `sapisidhash` cascades off
+the resulting profile-lock contention. These are obsolete — only
+`evaluate_fetch` is viable. Issue-#15 investigation notes had already
+disproven the "bearer header" hypothesis for `create_project`.
+
+**Where to investigate.**
+
+- The login OAuth flow *does* request the
+  `https://www.googleapis.com/auth/aisandbox` scope (visible in the sign-in
+  URL), so the account is authorized — the 401 points at how the credential is
+  *presented* to `aisandbox-pa`, not at missing authorization.
+- Capture a real generation request from `evaluate_fetch` — the exact URL,
+  headers, and credential it sends — and compare with what the Flow web UI
+  sends for the same action (browser DevTools network capture).
+- The `aisandbox-pa.googleapis.com` host may require a Bearer token: the
+  issue-#15 "bearer header" hypothesis was disproven for the `labs.google`
+  tRPC `create_project` route, but may hold for this *different* Google API
+  host.
+- Files: `src/gflow_cli/api/transports/experimental/evaluate_fetch.py`
+  (`generate_images`, `_generate_images_inner`, `_handle_response`,
+  `refresh_auth`) and `src/gflow_cli/api/client.py` (`_drive_image_generation`).
+
+**Workaround:** none known. Image generation against the live API does not
+currently succeed via the e2e transport path.
+
+---
+
+### Browser session expires periodically — manual re-login required
+
+- **Status:** Open · **Severity:** Medium · **Affects:** all versions · **Tracked:** N/A (architectural)
+
+Google's web session cookies aren't permanent. They expire when:
+- Long stretch of inactivity (typically months)
+- You change your Google password
+- You sign out from another device's session manager
+- Google flags the session as suspicious (geo-jump, new device fingerprint)
+
+When this happens, the next API call returns 401/403 and `gflow-cli` raises `AuthExpiredError`.
+
+**Workaround:**
+```bash
+gflow auth login --profile <name>
+```
+
+Re-running `auth login` reuses the existing profile dir (you typically just click "Continue as <you>" on the Google account chooser). No data is lost; only the cookie jar is refreshed.
+
+**Why we don't auto-refresh:** Google's session-refresh flow can include CAPTCHA / device verification that only a human can complete. A community SDK can't reliably automate that step. See [docs/AUTHENTICATION.md § Refresh / expiry](AUTHENTICATION.md#refresh--expiry).
+
+**Roadmap:** not scheduled. The Phase 4 hardening pass (v0.4.0a2) added typed `AuthExpiredError` + exit code `3` so scripts can branch on auth expiry deterministically. A periodic "session liveness" check + a `gflow auth refresh` command are still candidates for a later phase, but not committed to a version yet.
+
+---
+
+### Chromium cookie database locks block yt-dlp integrations (Instagram/restricted download paths)
+
+- **Status:** Mitigated · **Severity:** Low-Medium · **Affects:** any downstream helper calling `yt-dlp` (including `claude-video`, `cg-decode`/`refanalyzer`, or `experience-vault`)
+
+When executing `yt-dlp` from automated shell calls or Python wrappers while a Chromium-based browser (Chrome or Edge) is active, you may see:
+```text
+ERROR: Could not copy Chrome cookie database.
+```
+This is because Chromium holds an exclusive lock on its SQLite cookie database while active, causing `yt-dlp` to crash when attempting to extract cookies from the browser.
+
+**Mitigation & Workaround:**
+1. **Cookie Export:** Export Netscape-formatted cookies from your logged-in browser session to a static file (e.g. `ig_cookies.txt` or `.auth/ig_cookies.txt`).
+2. **Configuration Isolation:** Prevent `yt-dlp` from reading global user configurations that might force browser-cookie loading (e.g. `%APPDATA%\yt-dlp\config.txt` containing `--cookies-from-browser chrome`).
+   - In CLI calls, pass `--no-config` (or `--ignore-config`):
+     ```bash
+     yt-dlp --no-config --cookies path/to/cookies.txt [URL]
+     ```
+   - In Python `YoutubeDL` constructors, pass `"ignoreconfig": True` in the options dictionary:
+     ```python
+     opts = {
+         "cookiefile": "path/to/cookies.txt",
+         "ignoreconfig": True,
+     }
+     ```
+
+---
+
+
+### Flow's one-time upload-terms dialog blocks the FIRST upload on an account
+
+- **Status:** Mitigated · **Severity:** High until accepted (every `i2v --initial-frame` and `r2v --ref` on that account fails) · **Affects:** the migrated `flow.google.com` host, all versions through 0.71.0 · **Tracked:** [#719](https://github.com/ffroliva/gflow-cli/issues/719)
+
+Flow shows a one-time **"Rights to use this image"** confirmation the first time an account uploads a file. It renders **after** the file chooser has handed the file over, and Flow sends **nothing** until it is accepted — so the driver waited out its full 60 s budget for an upload request the page had already decided not to make, then reported:
+
+```
+MediaUploadRejectedError (exit 27): migrated host: no maseQ reply within 60s of choosing
+the file — the upload never reached Flow or was dropped
+```
+
+…and advised re-encoding the image to strip metadata. Neither the file nor the network was ever involved. Measured 2026-09-08 on three profiles, eight runs: the two accounts that had uploaded before never saw the dialog and uploaded fine; the account that never had failed 3/3. See [the spike](https://github.com/ffroliva/gflow-cli/blob/main/docs/superpowers/spikes/2026-09-08-migrated-upload-fails-two-ways.md).
+
+> **This entry previously said the opposite.** It read *"Affects: the legacy in-tree Compiled Growth worker, NOT `gflow-cli` itself"*, because *"gflow-cli's API-driven path bypasses this dialog entirely (the REST endpoint already implies acceptance)"*, with *"Workaround in gflow-cli: none needed."* That was true of the REST path and became false when the migrated driver started using the editor's **own** upload — so the entry a user hitting #719 would find was reassuring them about the exact thing that was breaking their run.
+
+**Mitigation** (v0.71.1): when the upload budget expires, the driver checks whether a dialog opened *during* the upload window and, if so, says so and points the user at the one-time acceptance instead of blaming the file.
+
+**Workaround / how to clear it — once per account, ever:** open the project on `flow.google.com`, upload any image by hand, and accept the dialog. Uploads on that account then stop hitting *this* failure.
+
+> **Accepting does not make every upload succeed — there is a second, unrelated failure on this path.** See the next entry. If you have already accepted the dialog and an upload still times out, you are not looking at this issue and repeating the workaround will not help.
+
+**gflow does not accept it for you, by design.** The dialog affirms that *you* hold the rights to the content you upload; that is not a claim a tool may make on an account owner's behalf. It is also a 30-second step, once, on a path that already requires an interactive browser login (`gflow auth login`) — so automating it would buy nothing and assert something on your behalf. There is deliberately no config flag: a setting that can never safely default to on, on a once-per-account event, is a flag nobody sets.
+
+**Legacy worker:** Compiled Growth's `flow_video.py` clicks "Concordo" / "Agree" in its own consent-dismiss block. That is a different product decision, recorded here so the two are not confused.
+
+---
+
+### An upload request leaves the page and Flow never answers (intermittent, migrated host)
+
+- **Status:** Open · **Severity:** Medium (intermittent; costs a re-run, spends nothing) · **Affects:** the migrated `flow.google.com` host, `video i2v --initial-frame` and `video r2v --ref` · **Tracked:** [#719](https://github.com/ffroliva/gflow-cli/issues/719)
+
+Distinct from the one-time upload-terms dialog above, and **not** fixed by accepting it. On an account that has already consented, roughly **1 upload in 4** sends the `maseQ` request — measured at 8 675 B for a 4 321-byte PNG, so the image is genuinely on the wire — and no reply ever arrives. Since v0.71.1 that reports:
+
+```
+MediaUploadRejectedError (exit 27): migrated host: no maseQ reply within 60s of choosing
+the file — the request left the page and Flow did not answer in time
+```
+
+The contrasting message, **`no upload request ever left the page`**, means something client-side stopped it before the network — the consent dialog above being the known cause.
+
+**Workaround:** re-run. The same file usually succeeds on the next attempt, and nothing is spent when it fails — Flow refuses before any submit.
+
+**Not the file.** Three different images were ruled out in [#719](https://github.com/ffroliva/gflow-cli/issues/719), including a 4.3 KB synthetic flat colour with no metadata, and the same file uploads successfully on other attempts. Re-encoding does not help; the remediation text that used to suggest it was wrong.
+
+**What is known.** A healthy upload window issues **4** POSTs; a failing one issued **24** — the full project-load rpcid inventory, firing ~2.6 s after the request went out, which is just before the ~2.8 s successful uploads take to answer. That has the shape of the page re-initialising underneath the in-flight upload, but no navigation event was captured, so the cause is unconfirmed. Measured 2026-09-08, 1 failure in 4 runs on one funded account — enough for "intermittent", not enough for a rate.
+
+### Flow's release-notes ("What's new") changelog popup blocks first-run UI automation
+
+- **Status:** Mitigated · **Severity:** Medium · **Tracked:** [#26](https://github.com/ffroliva/gflow-cli/issues/26)
+
+Google Flow ships a release-notes / "What's new" iframe (`changelogs/YYYY-MM-DD-...html`) the first time a logged-in profile visits the page after a Flow deployment. The iframe sits on top of the editor and intercepts pointer events on Flow's own controls — Playwright finds the right selector but cannot click it because the changelog is in the way. Issue [#26](https://github.com/ffroliva/gflow-cli/issues/26) confirmed the same iframe also blocks the settings menu after project navigation.
+
+**Symptom:**
+```
+playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceeded.
+  - <iframe ... src="https://www.gstatic.com/.../changelogs/...html"></iframe> ... intercepts pointer events
+  - retrying click action (57 retries, then timeout)
+```
+
+**Mitigation:** `UiAutomationTransport._dismiss_blocking_overlays(page)` detects Flow changelog iframes (`iframe[src*='/flow/changelogs/']`, `iframe[src*='/changelogs/']`) and dismisses them via a close-button selector cascade with an Escape-key fallback. Invoked after `_enter_editor` (image flow) and after `_wait_video_editor_ready` (video flow) so downstream clicks aren't intercepted. Structured logs identify what was dismissed; a debug screenshot is captured if dismissal cannot be confirmed.
+
+**Legacy workaround (no longer required):** open Flow in Chrome with the same profile once, click the `X` on the "What's new" popup, then close Chrome cleanly.
+
+**Update 2026-08-27 ([#593](https://github.com/ffroliva/gflow-cli/issues/593)) — the modal wedges more than the first run.** Captured live on two accounts (pt and en): the announcement sets `body { pointer-events: none }` while leaving the app neither `aria-hidden` nor `inert`, so controls read visible **and enabled** yet never receive a click. That is why the symptom is a bare `TimeoutError` naming nothing rather than the "intercepts pointer events" message above. Three gaps were closed:
+
+- The gallery "+ New project" sweep had no overlay check at all, so a modal there burned 18 selectors x Playwright's 30 s default click timeout before reporting the wrong error.
+- Dismissal reported success on click without verifying anything cleared — `overlay_dismissed` was logged on runs that then timed out elsewhere.
+- The Escape fallback is now gated on the page being provably blocked, which retires the [#395](https://github.com/ffroliva/gflow-cli/issues/395) hazard structurally.
+
+A block that survives dismissal now aborts pre-submit with exit 23 (probe `overlay_close_button`) and a screenshot, at zero credits, instead of hanging. Dismissal persists server-side — Flow records it as `videoFx.setLastAcknowledgedChangeLogId`, so one dismissal per announcement per account is the whole cost.
+
+**Follow-up 2026-08-28 — the one remaining epoch, found by audit.** #593 left a stated gap: call sites that neither route through `_probe_selector_cascade` nor sit behind a navigation gate. All 73 click/fill/press sites in the UI transports were then enumerated and classified, and exactly one survives the "can a modal actually land here?" test: the **image batch** loop's per-prompt boundary. A batch dismisses overlays once during setup, so from prompt 2 on the settings clicks are the first act after a multi-second generation wait on a page that never navigates. That one failed *silently* rather than loudly — `_open_gen_settings_panel` returns `False` when nothing matches and the caller falls back to Flow's current defaults, so a modal that mounted during prompt 1 generated prompt 2 at the wrong aspect/count. It now runs the same `_require_unblocked` check the navigation epochs use. Every other unguarded site fails loudly (exit 23 with a probe name and a screenshot, or an `overlay_postmortem` warning), which is why they are deliberately left unguarded rather than pre-guarded on a hunch.
+
+---
+
+### No in-CLI quota visibility — resolved on labs, still open on the migrated host
+
+- **Status:** Resolved 2026-09-05 for `labs.google` accounts · **Open** on accounts Google has migrated to `flow.google.com` · **Tracked:** [#795](https://github.com/ffroliva/gflow-cli/issues/795)
+
+Use `gflow credits user` for the selected profile or `gflow credits list` for all saved
+profiles. Both commands query Flow's current read-only credits endpoint with the saved browser
+session; `--json` provides a stable automation contract. The equivalent MCP surface is
+`gflow_get_credits`. The reported balance funds Veo video generation; image generation consumes
+separate per-model daily quotas.
+
+**On a migrated account there is still no in-CLI quota visibility.** The credits endpoint is
+reached with a token minted by `labs.google`, and for an account Google has moved to
+`flow.google.com` that session answers `200` with no `access_token` — it never mints one. So
+`gflow credits user` / `list` and `gflow_get_credits` fail on that cohort with "the labs.google
+session returned no access token". Through 0.73.1 this was reported as "aisandbox-pa
+authentication failed … SAPISID cookie missing, expired, or unreadable", which sent migrated
+users into a re-login loop that cannot terminate: aisandbox-pa had not been contacted and
+SAPISID was present and fine. 0.73.2 fixes the *message* only — the remediation now names the
+real cause. Reading a balance on the migrated host is **not** implemented
+([#795](https://github.com/ffroliva/gflow-cli/issues/795), open). Generation is unaffected.
+
+---
+
+### `gflow serve` / MCP worker queue: interrupted post-submit tasks need manual reconciliation
+
+- **Status:** Open (by design — no automated reconciliation) · **Severity:** Low · **Affects:** `gflow serve` daemon and MCP worker paths only (not the plain CLI, which has no queue)
+
+The worker queue (`generation_queue`, used by the `gflow serve` daemon and MCP tool calls) checkpoints every task's progress through `claimed` → `submit_attempted` → `remote_started` → terminal. If a task is interrupted (daemon restart, crash, or cancellation) while still `claimed` (before any submit), gflow-cli safely marks it `failed` — nothing was spent, safe to retry. But if it's interrupted at `submit_attempted` or `remote_started` — **after** the credit-spending submit click may have fired — it is marked `indeterminate` instead: a credit *may* have been spent and the outcome is unknown. An `indeterminate` task is **never** silently reported as `failed` and **never** auto-resubmitted (that could double-spend a credit for one generation).
+
+**Why this can't be resolved automatically today:** Flow's generation-status REST endpoint rejects a bare, cookie-only `page.request` re-check with HTTP 401 — only a live, authenticated Playwright SPA re-poll (opening the project page and reading the DOM) can turn a preserved handle back into a real status, and that live re-poll path is not wired into recovery yet (tracked for a future phase; see the C1 handle-spike notes in `docs/superpowers/specs/2026-07-19-production-readiness-hardening-design.md` Appendix A).
+
+**Decision (2026-07-21):** keep the safe stub — `recover_processing` marks post-submit interruptions `indeterminate` and never auto-resubmits, which is already correct. Building the auto-reconciler is deferred until **F1** (credit-free project-page re-entry) is confirmed against live Flow; until then a blind reconciler would be speculative code against unverified blackbox behavior. The `client` reconcile-hook seam and the live-gated `tests/e2e/test_crash_recovery_e2e.py` are already in place for when F1 lands.
+
+**Manual reconciliation:** an `indeterminate` row's checkpoint retains whatever handle/project info was captured before interruption. To resolve one by hand: open the relevant Flow project in the browser and check whether the expected asset appears.
+- **Found** — the generation completed; no action needed (the credit was spent as intended, just not auto-recorded locally).
+- **Not found after a few minutes** — it likely never completed; safe to resubmit the same prompt manually.
+
+**Queue payload schema (V0/V1):** the queue's `payload_json` carries an additive `schema_version` key. A payload with no `schema_version` key is legacy **V0** and decodes with the same field lookups as **V1** (the shape is otherwise identical) — both remain readable. The codec always *writes* the current version (`1`) on any re-encode. Any other version is treated as unknown and rejected with `QueueSchemaError` (**exit code 30**) rather than interpreted optimistically — this is a fail-closed guard against decoding a payload written by an incompatible future (or hand-edited) version.
+
+---
+
+### Aspect-ratio support depends on the Veo / Imagen model version
+
+- **Status:** Open · **Severity:** Low
+
+Currently confirmed:
+- Veo I2V: `9:16`, `16:9`, `1:1`
+- Imagen: `1:1`, `9:16`, `16:9`, `4:3`, `3:4`
+
+Other ratios may be silently rejected or coerced server-side. We validate in the CLI to whitelisted values to fail fast.
+
+---
+
+
+### REST API 401 — all `aisandbox-pa.googleapis.com` generation endpoints blocked
+
+- **Status:** **RESOLVED in v0.7.0** — image generation live-verified end-to-end
+- **Severity:** ~~High~~ · **Was-affecting:** v0.2.0a1 through v0.6.0a6
+
+> **Resolution (2026-05-20, v0.7.0):** `UiAutomationTransport` drives the Flow
+> editor so Flow's own JS issues every generation request with full auth
+> context — image generation now succeeds end-to-end (see
+> [`docs/LIVE_VERIFICATION_v0.7.0.md`](https://github.com/ffroliva/gflow-cli/blob/main/docs/LIVE_VERIFICATION_v0.7.0.md)). Video
+> T2V works at the library level via the same transport (Phase A, PR #23);
+> CLI wiring (`gflow video t2v/i2v/batch`) is queued for Phase B. The HTTP
+> transports under `experimental/` remain blocked by this 401 by design —
+> they are not on the production path.
+
+Even with a valid browser session (cookies present), calling Flow's REST API directly via `fetch` or `page.request` against `aisandbox-pa.googleapis.com` returns HTTP 401. This blocks **all** generation routes:
+
+| Endpoint | Status |
+|---|---|
+| `flowMedia:batchGenerateImages` (image gen) | ❌ 401 |
+| `video:batchAsyncGenerateVideoText` (T2V + I2V) | ❌ 401 (confirmed 2026-05-18 e2e run) |
+| `flow/uploadImage` (image upload for I2V) | ❓ untested (blocked before reaching this step) |
+| `video:batchCheckAsyncVideoGenerationStatus` (status poll) | ❌ 401 (confirmed 2026-05-19 — even via `page.request.post` from the authenticated browser context) |
+
+The Phase 0 video spike (2026-05-19) confirmed the **generation** routes *do*
+succeed when driven through the UI (Flow's own JS issues them) — but the
+**status-poll** route 401s even from `page.request.post` inside the authed
+page. Polling must therefore capture Flow's own status responses, not issue
+the request directly. See the video-generation design spec §10.5.
+
+`project.createProject` (on `labs.google/fx/api/trpc`) **does** work — it uses a different domain and auth model.
+
+**Root cause:** Google's backend has tightened security on `aisandbox-pa.googleapis.com`, requiring a browser fingerprint, `Origin`/`Referer` headers, and reCAPTCHA token that raw script-driven requests cannot provide.
+
+**Workaround:** Use the **UI Mimicry** approach — drive the Flow editor by clicking real buttons so the browser itself issues the generation requests with full auth context.
+
+**Roadmap:** v0.6.0a5 will add video generation (T2V + I2V) to the `UiAutomationTransport`, making it the single transport that covers both image and video generation. I2V requires driving the Flow UI's image-upload button so the browser calls `uploadImage` with its own session cookies.
+
+---
+
+### Output dir is not tidied automatically
+
+- **Status:** Open · **Severity:** Low · **By design**
+
+`gflow-cli` never deletes from `$GFLOW_CLI_OUTPUT_DIR`. Generated assets accumulate forever unless you clean them up.
+
+**Workaround:** schedule a cron / Task Scheduler job, e.g.:
+```bash
+# Delete files older than 30 days
+find "$HOME/Downloads/gflow-cli" -type f -mtime +30 -delete
+```
+
+---
+
+### `batchGenerateImages` HTTP 403 — WAF / reCAPTCHA `PUBLIC_ERROR_UNUSUAL_ACTIVITY`
+
+- **Status:** Open · **Severity:** High (blocks affected profile until WAF score decays or profile is replaced)
+- **First observed:** 2026-05-23 on profile `my-profile` during `gflow image batch` runs
+- **Surfaces as:** `gflow_cli.errors.WafRejectionError: WAF rejection (HTTP 403): batchGenerateImages HTTP 403 — reCAPTCHA score too low or WAF fingerprint mismatch`
+- **structlog signature:** `ui_automation.batch_response_seen` with `status=403` followed by `ui_automation.batch_403_body` containing `'message': 'reCAPTCHA evaluation failed', 'status': 'PERMISSION_DENIED', 'reason': 'PUBLIC_ERROR_UNUSUAL_ACTIVITY'`
+
+Distinct from the historical `aisandbox-pa` 401 (resolved in v0.7.0). The 403
+here means Flow accepted the session as authenticated but reCAPTCHA Enterprise
+scored the request as bot-like and blocked the generation call. The `my-profile`
+profile reproducibly 403s on `batchGenerateImages` even after a fresh
+`gflow auth login --browser chrome`; the same code path on profile `ffroliva`
+(re-authenticated the same day) succeeded end-to-end across one t2i + a 4-image
+batch — so it is not a global incompatibility but a per-profile WAF state.
+
+**Likely contributing factors:**
+- Repeated automated runs on the same profile within a short window
+- Playwright-driven Chrome leaks small fingerprint differences vs. unautomated
+  Chrome that reCAPTCHA Enterprise can score
+- The image-batch path issues several rapid-fire requests after the
+  count-tab clicks, which the scoring may treat as a single fast burst
+
+**Workarounds:**
+1. **Use a profile with lower WAF heat** — re-test on a different Chrome-strategy
+   profile (`gflow auth login --profile <new> --browser chrome`). The profile
+   that has been driven by recent automation runs is usually the hottest.
+2. **Let the WAF score decay** — typically hours to a day. Manually using real
+   Chrome on the same account in between can help (real interactions lower
+   the score).
+3. **Avoid same-day repeated batch runs** on a profile after a 403 — each
+   rejected request can raise the score further.
+4. **Widen the submission jitter** when composing multiple runs — `--jitter 10-30`
+   or `GFLOW_CLI_JITTER_RANGE` (#241); cadence guidance in
+   [DEBUGGING § WAF cadence](DEBUGGING.md#waf-cadence).
+
+> **What this means for your account:** a 403 is a *per-profile* WAF score, not an
+> account ban — the same account on a different profile has succeeded the same day.
+> The full picture (what the tool does to stay unremarkable, what it deliberately
+> does not do, and what we cannot promise) is in
+> [docs/ACCOUNT_SAFETY.md](ACCOUNT_SAFETY.md).
+
+**Tracked separately from** the architectural ["first-attempt listener-miss
+flake"](https://github.com/ffroliva/gflow-cli/pull/40) — that one was caused
+by editor mode confusion and is resolved by PR #40. WAF 403 is a fresh, distinct
+issue and not blocked by any code change in this repo.
+
+---
+
+### `UiAutomationTransport` selectors locale-agnostic — issue #24 Phase 5 complete
+
+- **Status:** Resolved (pending owner live e2e on non-EN profile) · **Severity:** Low · **Tracking:** [issue #24](https://github.com/ffroliva/gflow-cli/issues/24), [issue #94](https://github.com/ffroliva/gflow-cli/issues/94), [issue #170](https://github.com/ffroliva/gflow-cli/issues/170)
+
+  `--lang=en-US` removed in PR #127 (2026-05-30). All selector groups now use
+  locale-stable anchors: `IMAGE_MODEL_OPTION_SELECTORS` and
+  `VIDEO_MODEL_OPTION_SELECTORS` converted to `dict[Model, tuple[str, ...]]`
+  cascade structure; branded product names ("Nano Banana 2", "Nano Banana Pro",
+  "Imagen 4", "Veo 3.1 - *", "Omni Flash") are confirmed locale-stable
+  Google-branded identifiers. Locale is controlled by the `locale=locale_env`
+  Playwright kwarg (persists across all in-session navigations). Full resolution
+  gate: live e2e with `gflow image t2i` (each model) on a non-EN Chrome profile.
+
+  **2026-08-30 correction — locale-stable is not version-stable.** The claim
+  above that branded product names are safe anchors holds for *translation* and
+  nothing else. Flow renamed the video tier `Omni Flash` to `Omni 1.1 Flash`,
+  and because Playwright's `has-text` is a CONTIGUOUS substring match, a version
+  number inserted mid-label dropped `has-text('Omni Flash')` to zero matches.
+  Every explicit `--model omni-flash` run then failed loud with
+  `VideoModelSelectionError` (exit 18, no credits spent) — the fail-loud gate
+  worked exactly as designed, but the model was unusable until the selector was
+  fixed. `VIDEO_MODEL_OPTION_SELECTORS[OMNI_FLASH]` now uses two ANDed
+  `has-text` clauses (`'Omni'` + `'Flash'`) that span the version segment, plus
+  the `:not(:has-text('[Lower Priority]'))` exclusion its `VEO_3_1_LITE` sibling
+  already carries — without it an 'Omni 1.1 Flash [Lower Priority]' tier would
+  match two menuitems and put the model straight back at exit 18.
+  `tests/flow_selectors/test_model_governance.py` grades it against BOTH labels
+  Flow has shipped plus a no-collision check against the four `Veo 3.1 - *`
+  tiers. The rule this generalises to is NOT a blanket "always match tokens" —
+  it depends on whether gflow's own identifier pins the version. `omni_flash`
+  carries no version, so the `1.1` in Flow's label is noise and the anchor must
+  span it. The four `Veo 3.1 - *` selectors deliberately keep the contiguous
+  version, because `VEO_3_1_FAST = "veo_3_1_fast"` makes `3.1` part of the
+  model's identity there: if Flow replaces that tier with a `Veo 3.2`, a loud
+  MISS is the CORRECT outcome, and widening those anchors to
+  `has-text('Veo'):has-text('Fast')`-style token pairs would silently bind
+  `--model veo-fast` to a different tier at a different credit price. Ask which
+  of the two shapes you have before widening. The CLI alias (`--model omni-flash`) and the enum value
+  (`omni_flash`) are gflow's own identifiers and deliberately did NOT change —
+  they are a stable contract for chain files, resume state, and JSON output.
+
+  **2026-06-12 correction (issue #170):** the "all selector groups" claim above
+  had two stragglers — `PICKER_INCLUDE_BUTTON` and `PICKER_CONTEXT_INCLUDE`
+  hardcoded the pt-BR caption "Incluir no comando", breaking
+  `--reference-entity` (image t2i), movie R2V entity attach, and Vozes voice
+  attach on every non-Portuguese account (Flow renders in the ACCOUNT language;
+  `?hl=en` cannot override it). Fixed by converting both constants to sequential
+  tier cascades — context-menu Tier 1 is the locale-free `add`-ligature menuitem
+  scoped to the open menu; the Vozes button has no ligature, so pt/ru/en text
+  leads with a lone-iconless-dialog-button structural fallback. The matched tier
+  is emitted as `ui_automation_video.include_selector_tier` (drift telemetry),
+  exhaustion raises typed `TransportTimeoutError` (exit 9) with a locale-neutral
+  remediation hint, and an image-side submit backstop now raises
+  `WireFormatError` when a requested entity never rode the wire.
+
+**Phase 2 progress (2026-05-25, develop / post-v0.8.1, unreleased):**
+
+- **`ONBOARDING_SELECTORS` restructured** — replaced the original 9 English/PT-BR
+  text-only entries with a two-tier cascade:
+  1. `_ONBOARDING_STRUCTURAL_SELECTORS` (3 strict entries) — locale-free ARIA/ID
+     anchors: `button#L2AGLb` (Google Funding Choices SDK stable ID) plus exact
+     ARIA-label matches (`Accept all`, `I agree`). These are programmatic SDK
+     constants, not UI strings.
+  2. `_ONBOARDING_TEXT_SELECTORS` (~37 entries) — leads with two
+     case-insensitive ARIA-partial entries (`aria-label*='Accept' i` /
+     `*='Agree' i`) that catch many CMP dialogs (OneTrust, Cookiebot) whose
+     aria-label values stay in English even on non-EN pages, followed by
+     `:has-text()` selectors covering 14 locales: EN, PT, DE, ES, FR, IT, NL,
+     JA, ZH, KO, PL, RU, TR, ID. The ARIA-partial entries live in this tier
+     because English aria-label values are not guaranteed across every CMP.
+  3. `ONBOARDING_SELECTORS = (*_ONBOARDING_STRUCTURAL_SELECTORS, *_ONBOARDING_TEXT_SELECTORS)`
+     so structural entries are always tried first.
+  Cascade-ordering invariant is verified by `TestBypassOnboarding` in
+  `tests/api/transports/test_ui_automation.py`.
+
+- **`_attach_frame` (I2V/R2V frame slots) flipped to structural-first** — was
+  English text-label first (`FRAME_SLOT_BY_LABEL`) with structural fallback; now
+  tries `FRAME_SLOTS_STRUCT` first, falls back to `FRAME_SLOT_BY_LABEL` only
+  when structural count is insufficient. Slot selection unit tests live in
+  `TestAttachFrameSlotSelection` (`tests/api/transports/test_ui_automation_video.py`).
+
+  **Correction (2026-05-26, issue #63):** PR #70's original
+  `FRAME_SLOTS_STRUCT = "div:has(> button:has(i.google-symbols:text-is('swap_horiz'))) > div[aria-haspopup='dialog']"`
+  matched **zero** elements on real Flow DOMs — the `swap_horiz` icon uses class
+  `material-icons` (NOT `google-symbols`) and the slots are `<div type="button">`,
+  not children of any `div > button` wrapper. Production I2V therefore relied on
+  the English-text fallback and silently broke on non-EN profiles. Discovered
+  via DOM probe + LIVE e2e on `ffroliva` (de-DE → pt-BR effective). Replaced
+  with `FRAME_SLOTS_STRUCT = "div[type='button'][aria-haspopup='dialog']"` (a
+  unique pattern in Flow's editor). Also added a `.first` fallback for the
+  End-frame case — after Start is attached, only one structural slot remains
+  and the prior `.nth(slot_index)` went out-of-bounds. Both fixes shipped
+  together via [#63](https://github.com/ffroliva/gflow-cli/issues/63).
+
+- **`GFLOW_CLI_LOCALE`** — Playwright `locale=` env override from PR #51 remains
+  available (default `en-US`).
+
+- **`--lang=en-US` dependency reduced** — `ONBOARDING_SELECTORS` and `_attach_frame`
+  no longer require it. The arg is still passed because removing it requires a
+  broader live-e2e sweep (I2V/R2V across multiple locales); it will be dropped
+  once that completes.
+
+- **Live e2e on `de-DE` (2026-05-25)** — `GFLOW_CLI_LOCALE=de-DE` T2V on
+  `ffroliva` (Pro) completed in 70.9 s and returned `MEDIA_GENERATION_STATUS_SUCCESSFUL`
+  with a 3.1 MB 1280×720 H.264 mp4 (8 s clip). Confirms the structural-first
+  selectors and `GFLOW_CLI_LOCALE` env override work end-to-end on a locale
+  outside the original 9-entry English/PT-BR list.
+
+- **Live I2V e2e on `de-DE` (2026-05-26, issue #63 closure)** —
+  `GFLOW_CLI_LOCALE=de-DE` I2V (Start + End frames) on `ffroliva` via
+  `tests/e2e/test_transports_e2e.py::test_e2e_i2v_start_end_frame_attach`
+  completed in 124 s and returned a terminal `SUCCESSFUL` `VideoResult` with a
+  downloaded mp4 carrying valid `ftyp` magic bytes. The test asserts on the
+  `ui_automation_video.frame_attached` structlog event for both Start and End,
+  proving the structural cascade resolved both slots without falling through
+  to the EN-text tier. Note: Chrome's UI rendered in pt-BR despite
+  `GFLOW_CLI_LOCALE=de-DE` (env affects Playwright's `Accept-Language`, not
+  Chrome's profile language) — both are non-EN so the test still verifies the
+  locale-leak fix.
+
+**Earlier — Phase 7 multi-image-prompt work** addressed the count-tab selectors:
+- `_COUNT_TAB_TEXT_RE = ^(1x|x[1-4])$` only matches the digit+x format Flow
+  renders identically in every locale (numbers/symbols are not translated).
+  Widened for #404: Flow renamed the count-1 label from `1x` to `x1`
+  (uniform `xN`, live-verified 2026-07-31); both cohorts are accepted.
+- `_set_count` clicks the tab carrying the desired DIGIT (`1x`/`x1` for
+  count=1), not a position — the #404 rename shrank the old filtered set and
+  shifted every `.nth(count - 1)` pick by one. Non-convergence raises
+  `UiSelectorDriftError` (exit 23) with desired vs displayed counts.
+
+**Earlier — PR #48:**
+- Added `--lang=en-US` Chromium launch arg; parts of `NEW_PROJECT_SELECTORS` /
+  `SUBMIT_BUTTON_SELECTORS` tails still match by English text (icon-first selectors
+  lead and cover the common path, so these are maintenance debt rather than
+  active blockers).
+
+**Remaining gate:** live e2e with `gflow image t2i --model <each>` on a non-EN
+Chrome profile (`GFLOW_CLI_LOCALE=<non-EN>`) to confirm model picker resolves
+correctly without `--lang=en-US`. `--lang=en-US` has been removed (PR #127);
+`locale=locale_env` Playwright kwarg provides locale continuity across navigations.
+
+**Workaround:** with Phase 2 changes, most locales are handled automatically.
+For locales outside the 14 covered by `_ONBOARDING_TEXT_SELECTORS`, ARIA-based
+structural selectors fire first and cover Google's Funding Choices consent SDK.
+For non-standard CMP dialogs not covered, prefer accounts whose Flow renders in
+one of the 14 supported locales or in English.
+
+---
+
+### t2v response can omit operation name — `flow_operation_id` persists NULL
+
+- **Status:** Open · **Severity:** Low · **Affects:** v0.9.0+ (data layer)
+
+The data layer's `on_started` callback captures
+`operations[0].operation.name` from each `batchAsyncGenerateVideoText`
+response and persists it as `operations.flow_operation_id`. This field
+is **best-effort, not guaranteed for any model**: `omni-flash`'s response
+shape does not carry it, so omni-flash rows end up with
+`flow_operation_id` NULL. **Update 2026-07-21 (live):** the same NULL
+was observed on a live `veo-lite` t2v run (`remote_started` checkpoint
+with `operation_id=None`), on an agentic-UI-cohort account — so `veo-*`
+is not a reliable guarantee either; the original claim that veo-* rows
+always carry the operation name was false. The rest of the row (prompt,
+model, aspect, started/completed timestamps, batch ID, output paths) is
+recorded normally regardless.
+
+**Impact:** cosmetic/provenance-only — `media_id` is the canonical
+handle (poll, download, and every CLI lookup use it, not
+`flow_operation_id`). `gflow data media <id>` and provenance lookup by
+Flow media ID still work. Nothing in the current CLI queries by
+`flow_operation_id`; a future feature that did would miss rows on any
+model whose response omits the operation name.
+
+**Workaround:** none needed if you don't query by `flow_operation_id`.
+
+**Roadmap:** capture response samples across models (including veo-lite)
+where the operation name is absent, identify the equivalent provenance
+handle (if any), and either map it into `flow_operation_id` or document
+that these cases legitimately have no such identifier. Track via a
+follow-up issue once samples are captured.
+
+---
+
+### `gflow video chain` re-exposes the i2v→t2v silent-route risk (issue #125)
+
+- **Status:** Mitigated · **Severity:** Medium · **Affects:** `gflow video chain` (v0.12.0)
+
+Every chain link after the first is an image-to-video (I2V) generation seeded by
+the previous clip's last frame. The silent-route defect historically observed on
+`gflow video i2v` ([issue #125](https://github.com/ffroliva/gflow-cli/issues/125))
+applies here: a model/mode mismatch can make Flow drop the seed frame and route
+the request to the plain text-to-video endpoint
+(`batchAsyncGenerateVideoText`) — burning a credit for a text-only clip that
+breaks continuity, with no error from Flow. (Observed live for omni-flash i2v
+on 2026-05-30; omni-flash *single-clip start-frame* i2v was re-verified working
+on the wire 2026-08-03 and re-enabled for `gflow video i2v`.)
+
+**Mitigation (two layers):**
+1. **Model pin.** `omni-flash` is removed from the chain `--model` choices and
+   rejected by the orchestrator **before any spend**
+   (`ModelModeIncompatibilityError`, exit 17): its single-clip start-frame i2v
+   is wire-verified, but N seeded links back-to-back has not been verified at
+   chain scale, so chains stay on the Veo 3.1 family.
+2. **Per-link wire-route abort.** For each seeded link the transport inspects the
+   captured generate-response URL; if it observes `batchAsyncGenerateVideoText`
+   for an i2v link it raises `WireFormatError` (logged
+   `ui_automation_video.i2v_routed_to_t2v`, issue #125) rather than reporting a
+   fake success. The chain aborts and preserves every link completed before the
+   failure (`ChainPartialError`).
+
+**Workaround:** stick to the Veo 3.1 models (`veo-lite` / `veo-fast` /
+`veo-quality` / `veo-lite-lp`); these are the only accepted chain models.
+
+---
+
+### `gflow video chain` continuity caveat — black / fade-out final frame
+
+- **Status:** Open · **Severity:** Low · **Affects:** `gflow video chain` (v0.12.0)
+
+Chain seeds each link with the **last frame** of the previous clip. If a clip
+fades to black (or to a near-empty frame) at its very end — common with
+cinematic prompts — the extracted seed frame is mostly black, so the next link
+starts from black and continuity visibly breaks.
+
+**Workaround:** pass `--seed-offset MS` to extract the seed frame a few hundred
+milliseconds **before** end-of-file, skipping the fade. For example
+`--seed-offset 200` seeds from 200 ms before EOF. Tune per the fade length of
+your prompts.
+
+---
+
+### `gflow video chain` outputs N clips, not one file — auto-concat is deferred
+
+- **Status:** Open (by design) · **Severity:** Low · **Affects:** `gflow video chain` (v0.12.0)
+
+A chain produces **N separate mp4s** (one per link), not a single stitched
+video. Auto-concatenation is deferred: Flow's server-side concatenation
+(`runVideoFxConcatenation`, used by `gflow scene`) is **project-scoped** — every
+clip must live in the same Flow project to be concatenated. But chain links are
+*generated* sequentially and generation cannot pin all links to one shared
+project, so there is no clip set the concat endpoint could combine at the end of
+a chain run.
+
+**Workaround:** stitch the link clips into one file with `gflow scene`
+(server-side, credit-free, no ffmpeg) after the chain completes. The chain
+prints its `chain_id` and a reminder to do this on success.
+
+**Roadmap:** wiring chain links into a single Flow project so the chain can
+auto-concat its own output is under consideration — tracked as backlog.
+
+---
+
+### `gflow video chain --resume-from` re-seeds the first resumed link as T2V
+
+- **Status:** Open · **Severity:** Low · **Affects:** `gflow video chain` (v0.12.0)
+
+`--resume-from <chain-id>` skips links already paid for in a prior run (they are
+**not** re-billed) and continues from the first incomplete link. However, the
+first resumed link is generated as a **text-to-video** link, not seeded from the
+last frame of the last completed link — there is no cross-run seed-frame
+hand-off yet. The resume is **credit-safe** (no double-billing), but visual
+continuity restarts at the resume point: the first resumed clip will not flow
+seamlessly from the clip before it.
+
+**Workaround:** if seamless continuity across a resume boundary matters, re-run
+the affected tail of the chain from scratch rather than resuming, or stitch with
+`gflow scene` and accept the cut at the resume boundary.
+
+**Roadmap:** persist and re-extract the boundary seed frame so a resumed link can
+continue as a seeded I2V generation — tracked as backlog.
+
+---
+
+## Mitigated
+
+### Flow can pin the agentic cohort server-side for hours
+
+The classic↔agentic editor arm is server-assigned per page load and normally
+flaps, but an account can be **pinned agentic for an extended stretch**:
+observed on the #338 cycle (2026-07), where an account stayed agentic ~2 h and
+the persisted toggle-off + one sanctioned reload (v0.38.1) recovered classic
+only once the pin lifted. **Mitigation:** the UI-mode policy fails fast
+pre-submit (`UiModeUnavailableError`, exit 28, $0 spent, machine-flagged
+retryable) instead of burning selector timeouts mid-flow, and the error text
+names the pinning case. Retrying *immediately* during a pin is futile — wait a
+while or switch `--profile`. Recorded as the #299 PR-B predict-gate evidence:
+retry loops must never key off the pinned signature.
+
+**Update 2026-08-28 ([#595](https://github.com/ffroliva/gflow-cli/issues/595)) — images
+now reach this fail-fast by default.** Two accounts flipped agentic on 2026-08-27 and a
+plain `gflow image t2i` failed on both, because `auto` bound whatever rendered and the
+agentic driver cannot satisfy an image request (either `image_mode_tab` selector drift or
+a `WireFormatError` about video bytes — neither naming the cause). `auto` now resolves to
+`classic` for images too, so a pinned account gets the exit-28 abort described above
+instead of a mid-run failure, and `GFLOW_CLI_PREFER_CLASSIC=1` is no longer the
+workaround anyone needs to discover.
+
+### Flow's agent-mode chip hides the settings trigger on `flow.google.com` (exit 23)
+
+- **Status:** Mitigated · **Severity:** High while it lasts (every video run on the account fails) · **Affects:** the migrated `flow.google.com` host, all versions through 0.71.0 · **Tracked:** [#749](https://github.com/ffroliva/gflow-cli/issues/749), follow-up [#752](https://github.com/ffroliva/gflow-cli/issues/752)
+
+The migrated composer has an **Agent** chip. Pressed, Flow swaps the prompt box and
+leaves `.settings-trigger-button` — the element this driver waits on — in the DOM under
+a bare `hidden` (`display: none`, 0×0). Flow **remembers the chip per account**, so a
+single click in a browser made every later `gflow video` run on that account die at 30 s
+as `UiSelectorDriftError` (exit 23), telling the user to file a frontend-drift bug about
+a frontend that was working correctly.
+
+**Mitigation** (v0.71.1): the readiness gate leaves agent mode by
+itself, so an account parked there recovers with no user action. If it cannot, the error
+now names which of three things happened rather than blaming drift:
+
+| The message says | What it means | What to do |
+|---|---|---|
+| `the account is in Flow's agent mode … the chip could not be clicked` | something is covering the chip (a modal) | dismiss it in a browser; re-run |
+| `the chip was clicked, and it is STILL pressed` | the mode is pinned on this account | turn the **Agent** chip off in a browser; re-run |
+| `agent mode was left, but the settings trigger … still did not become visible` | the mode is off — this is real selector drift | file a bug; it is not this issue |
+| `the chip could not be read back, so whether the mode is still on is unknown` | the page went dark mid-recovery | check the **Agent** chip in a browser *before* filing this as drift |
+| `the settings trigger … is not visible — the account is in Flow's agent mode` | the mode flipped **mid-run**, after the editor was already ready | turn the **Agent** chip off in a browser; re-run |
+
+**On 0.71.0 and earlier there is no recovery.** Open the project on
+`flow.google.com`, click the **Agent** chip off, and the account works again.
+
+**Follow-up ([#776](https://github.com/ffroliva/gflow-cli/issues/776)) — the same
+confusion survived one gate later, on the *click*.** The table above covers the readiness
+*wait*. A control that passes that wait and then refuses the click used to expire as a bare
+Playwright `TimeoutError`: exit 1, no locator, no cause. It now reports what was observed
+at the moment it expired, because the cause could not be measured — Flow's announcement
+overlay is a labs.google measurement that has never been reproduced on this host, and a
+mid-run agent-mode flip is equally consistent with the evidence.
+
+| The message says | What it means | What to do |
+|---|---|---|
+| `… did not accept a click … the account is in Flow's agent mode` | the mode flipped after the editor was ready | turn the **Agent** chip off in a browser; re-run |
+| `… it is covered by <tag>.<class>` | something is stacked over the control — the class names it | dismiss it in a browser; re-run |
+| `… the page is accepting no pointer events at all` | an overlay has the whole app blocked (#593's shape) | dismiss it in a browser; re-run |
+| `… it carries a bare `hidden` attribute` / `it is disabled` | the control is present but not usable | usually agent mode or a cohort difference; check the Agent chip first |
+| `… it is not rendered (display, visibility, or a zero-sized box)` | it is in the DOM but not on screen | as above — check the Agent chip, then file a bug with the log |
+| `… it answers no hit test at its own centre` | nothing named itself as the cover, but the click still landed elsewhere | re-run once; if it repeats, file a bug — an overlay outside the document is the usual shape |
+| `… it was visible, enabled and hit-testable … most likely still moving` | nothing readable was wrong | Playwright also needs a *stable* box; re-run once. If it repeats, file a bug — this message means we looked and found nothing, which is a real finding worth having |
+| `… it could not be read back` | the page changed under the diagnosis | re-run; if it repeats, attach the log |
+
+The occluder is named by tag plus framework class only. That is deliberate — a signed-in
+Flow page carries the account email and signed media URLs on exactly the elements that
+tend to occlude things, and this message is printed, logged, and pasted into issues.
+
+### `gflow auth login --account` reports a mismatch but leaves the profile in place
+
+- **Status:** Open · **Severity:** Medium (no data loss; the risk is *which account pays*) · **Affects:** `gflow auth login --account <email>`, v0.73.0 onward · **Tracked:** [#773](https://github.com/ffroliva/gflow-cli/issues/773) item 3
+
+`--account` asserts that the login authenticated as the account you named, and a mismatch
+raises **exit 38** with one `auth.account_assert_failed` log line. What it does **not** do is
+quarantine, rename or otherwise mark the profile — so a later run re-reads a profile
+authenticated as somebody else, with nothing persisted to say so. On a product that bills
+generations to the signed-in Google account, that is the wrong account paying.
+
+This was a deliberate "minimum" in review round 4 of
+[#764](https://github.com/ffroliva/gflow-cli/pull/764), recorded here so the decision stays
+revisitable rather than lost in a merged thread.
+
+**Workaround:** after any exit 38 from `--account`, check `gflow auth list` and re-run
+`gflow auth login --account <email>` for that profile before generating. Do not assume the
+failed assert left the profile unusable — it is usable, just possibly as the wrong person.
+
+Two further items on the same issue are unfixed and worth knowing about: a second chooser
+hop (chooser → consent → chooser) is not handled and degrades into the landing timeout, and
+that timeout is still an unmeasured number.
+
+### Auth verification depends on Google's NextAuth session endpoint
+
+- **Status:** Mitigated · **Severity:** Low (degrades fail-closed) · **Affects:** issue #15 fix onward · **Tracked:** issue #15
+
+`gflow auth login` verifies a real Flow sign-in by calling
+`https://labs.google/fx/api/auth/session` (see `src/gflow_cli/auth/verification.py`)
+and by checking for the Google `SAPISID` cookie. These are **external Google
+surfaces** — if Google changes the endpoint path, the response shape, or the
+cookie names, verification degrades **fail-closed**: it reports
+`VERIFICATION_ERROR` (an honest "could not verify") rather than a false
+success. The expected authenticated response shape is pinned by the
+`AUTHENTICATED_BODY` fixture in `tests/auth/test_verification.py` — a Google
+change surfaces there as a failing test. Start any investigation of a sudden
+`gflow auth login` verification failure at that fixture and `verification.py`.
+
+Since PR #168 the production entry point is `verify_flow_profile`, which reads
+the session cookie **directly from Chrome's SQLite store** via `browser_cookie3`
+(a no-browser fast path) and only falls back to launching Playwright when that
+decryption fails. This adds two more local surfaces to check when verification
+fails unexpectedly: a Windows **DPAPI decrypt failure** (cross-user / cross-machine
+key — surfaces as a `RuntimeError` that `auth/cookies.py` normalizes to
+`PermissionError` to trigger the Playwright fallback) and a **locked cookie DB**
+(Chrome still running holds an exclusive SQLite lock). Both degrade fail-closed.
+
+---
+
+### Same profile can't be used in parallel
+
+- **Status:** Mitigated (crash → typed fail-fast rejection) · **Severity:** Low · **Affects:** all versions
+
+Chromium refuses to open two persistent contexts on the same `user-data-dir` simultaneously. Historically this surfaced as an unhelpful Chromium "ProcessSingleton: profile is locked" error partway through a run. As of the profile-lease hardening (production-readiness plan, slice D1/D3), gflow-cli enforces this itself: a cross-process advisory lock (`ProfileLease`, kernel `flock` on POSIX / `msvcrt.locking` on Windows) guards every profile directory. A second `gflow` invocation, `gflow serve` daemon task, or MCP call against an already-leased profile is rejected **immediately** by default — before any Chrome process starts — with a typed `ProfileLockedError` (**exit code 11**); it never silently corrupts the profile. Since #478, setting [`GFLOW_CLI_LEASE_WAIT_SECONDS`](CONFIGURATION.md#gflow_cli_lease_wait_seconds) opts a waiter into a bounded wait that takes over as soon as the current holder finishes (holders always run to completion and are never asked to release early; same-process contention still fails fast — waiting on yourself would deadlock).
+
+**Workaround:** use different profiles for parallel work — different profiles acquire independent leases and run fully concurrently.
+
+### gflow refuses to open my profile after a downgrade ("written by a newer Chromium", exit 11)
+
+- **Status:** Working as intended (guard shipped in v0.56.0, #477)
+- **Affects:** any bundled-Chromium open of a persisted profile after gflow-cli
+  (and with it the bundled Playwright Chromium) was downgraded
+
+This refusal is deliberate: opening a Chrome profile with an older Chromium
+**major** version than last wrote it triggers Chromium's downgrade cleanup,
+which can shred the newer session store and surface later as a mystery logout.
+The error names both versions and the remedy. Fix: upgrade gflow-cli (and run
+`playwright install chromium`), or re-create the profile with
+`gflow auth login` — login is deliberately unguarded as the recovery path.
+`chrome`-strategy profiles are exempt (real Chrome manages its own lifecycle).
+Full detail: [AUTHENTICATION § Chromium downgrade guard](AUTHENTICATION.md#chromium-downgrade-guard).
+
+```bash
+# Terminal 1
+gflow image batch ./batch-a.tsv --profile work
+
+# Terminal 2 — different profile, same time, OK
+gflow image batch ./batch-b.tsv --profile personal
+```
+
+**Roadmap:** Phase 4 (v0.4.0a2) added a per-worker Page pool on one shared BrowserContext (`GFLOW_CLI_CONCURRENCY=N`), intended to let one `gflow-cli` process fan out multiple in-flight generations, but no current CLI command drives more than one generation at a time through it — the only feature that did (a manifest-driven video batch runner) never worked and was removed. Cross-process same-profile serialization remains a hard constraint (Chromium can only own one persistent context per `user-data-dir`) — but it is now a clean, typed, fail-fast rejection instead of an unstructured crash. Multiple shells against the same profile can either use different profiles (fully parallel) or opt into the bounded wait via `GFLOW_CLI_LEASE_WAIT_SECONDS` (serialized, waiter takes over when the holder finishes).
+
+---
+
+## Resolved
+
+### `character create` generated portraits that never bound to the character — RESOLVED in v0.45.0
+
+- **Status:** Resolved ([#395](https://github.com/ffroliva/gflow-cli/issues/395)) · **Severity:** Was-High · **Was-affecting:** v0.44.0 and unreleased `develop` · **Fixed in:** v0.45.0
+
+Every `gflow character create` spent an Imagen credit, produced an image, and
+left the character empty ("Untitled Character", null thumbnail). Flow filed the
+generation as an ordinary project image because the request carried no
+`entityContext`. Two independent gflow defects caused it:
+
+1. **Overlay dismissal Escaped Flow's own UI.** `[role='dialog']` and
+   `[role='alert']` had been added to the overlay detector, but Flow's character
+   composer — and the media picker — carry those roles. gflow pressed Escape on
+   the app itself and the submit lost its entity context.
+2. **The character route could bounce to the project page.** Flow redirects
+   `/project/{id}/character/{entityId}` while the entity is not yet queryable
+   (gflow navigates immediately after `flow.createEntity`). The project page
+   also mounts a prompt box, so the readiness gate passed on the wrong surface
+   and the prompt was typed into the **project** composer.
+
+Both are fixed: the two over-broad selectors are gone (banner detection intact),
+and the transport now verifies it came to rest on the character route,
+re-navigating and then failing loudly instead of generating on the wrong
+surface. The `parentEntityId` guard that surfaced this was correct throughout —
+it refused to report a portrait-less character as success.
+
+Wire contract: [CHARACTER_RECON § entity binding](https://github.com/ffroliva/gflow-cli/blob/main/docs/CHARACTER_RECON.md#entity-binding-entitycontext-captured-live-2026-07-28).
+Evidence: [LIVE_VERIFICATION_v0.45.0 §2](https://github.com/ffroliva/gflow-cli/blob/main/docs/LIVE_VERIFICATION_v0.45.0.md).
+
+### `gflow video`'s manifest-driven batch subcommand didn't skip already-completed entries — RESOLVED as obsolete
+
+- **Status:** Resolved (obsolete) · **Severity:** Was-Medium · **Was-affecting:** v0.2.0a1 through the command's removal · **Fixed in:** n/a — removed in production-readiness hardening (see `fix: remove nonfunctional video batch command`)
+
+This entry described a gap in `gflow video`'s `batch` subcommand: it never
+maintained a local manifest-of-outputs, so rerunning a partially completed
+TSV manifest after a mid-run failure would re-submit already-rendered rows
+and could burn additional credits. The command itself, however, never
+actually worked end-to-end — it always exited with a stub error before
+reaching Flow — so no run could have been "partially completed" in the
+first place. It has since been removed entirely as a nonfunctional stub.
+The underlying command no longer exists, so this gap is moot rather than
+fixed; kept here for searchability. `gflow image batch` (the real, working
+batch command) is unaffected. For video, loop `gflow video t2v`/`i2v` from
+the shell — see [`docs/USAGE.md` § Batch video generation (shell loop)](USAGE.md#batch-video-generation-shell-loop).
+
+### False "forced agentic — not recoverable" aborts from an icon-heuristic cohort probe
+
+- **Status:** Resolved · **Severity:** Was-Medium (spurious exit-25 aborts on profiles that could in fact reach classic mode) · **Was-affecting:** `--ui-mode classic` and classic-only operations through v0.37.0 · **Fixed in:** 0.38.0 · **Tracked:** [#299](https://github.com/ffroliva/gflow-cli/issues/299), [#332](https://github.com/ffroliva/gflow-cli/issues/332)
+
+The forced-agentic detection keyed on UI icons including `apps_spark_2` — which is
+Flow's **Tools** button, present in BOTH cohorts — so a classic-capable profile could
+be misclassified as an unrecoverable agentic cohort and abort with exit 25. Recovery
+was a blind single click on the Agent pill with no state verification. v0.38.0
+replaces this with a state-aware mode controller (`mode_control.py`) that reads the
+Agent toggle's `aria-pressed` attribute (false = classic media, true = agent —
+locale-invariant), closes the expanded chat sidebar first, toggles off only when
+actually in agent mode, and re-verifies. Live-verified with a full
+classic→agent→classic round-trip and a real agentic→classic recovery in the v0.38.0
+release run ([evidence](https://github.com/ffroliva/gflow-cli/blob/main/docs/LIVE_VERIFICATION_v0.38.0.md)).
+
+### Agentic image generation could silently attribute a pre-existing project asset as the "generated" image
+
+- **Status:** Resolved · **Severity:** Was-High (wrong file downloaded and reported as success, silently) · **Was-affecting:** the agentic driver through v0.30.0 (and, for the pre-download guard below, every transport) · **Fixed in:** unreleased (0.31.0) · **Tracked:** [#281](https://github.com/ffroliva/gflow-cli/issues/281); related picker fix [#282](https://github.com/ffroliva/gflow-cli/issues/282)
+
+Discovered 2026-07-10 in a live production run: `gflow image t2i` under the
+agentic driver downloaded an **old project logo** and reported it as a freshly
+generated "portrait" — no error, just the pre-existing warn-only line
+`"Generated media was saved, but local history was not updated."` — and 11
+downstream `i2i` scenes were then anchored to the wrong file.
+
+**Root cause — two defects in `await_images` (agentic driver):**
+1. The new-media baseline was a **single** DOM scrape (`_scrape_img_srcs`); a
+   pre-existing tile that rendered lazily (after generation had already
+   started) was missed by that scrape and then counted as "new" once it
+   appeared.
+2. `_build_generated_images` sliced an **unordered** UUID set down to
+   `expected_count` — an arbitrary pick when more "new" UUIDs were present
+   than were actually requested, with no signal for which UUID(s) belonged to
+   this generation.
+
+**A third, independent gap** existed downstream of the driver: even a transport
+that never hits the agentic DOM-scrape path above could still hand back a
+`flow_media_id` already present in local history for the profile. That case
+was caught by the generic `DataStoreError` path, which only warned and
+continued — a silently duplicated/misattributed history row, not a hard
+failure.
+
+**Fix — three defense layers, all raising the new `MediaAttributionError`
+(exit code 26, RFC 9457 type `media-attribution`) instead of a silent or
+warn-only outcome:**
+1. **Baseline settle.** The baseline is now the **union of two
+   `_scrape_img_srcs` passes** one poll interval apart, absorbing lazy-render
+   stragglers before they can be mistaken for new media.
+2. **Ambiguity fail-fast.** If more new UUIDs still appear than were
+   requested, `await_images` raises `MediaAttributionError` naming every
+   candidate UUID and the expected count, rather than guessing via
+   `_build_generated_images`'s old arbitrary slice.
+3. **Pre-download attribution guard + collision escalation.**
+   `OperationRecorder.verify_media_attribution()` (called from `cli_image.py`,
+   `image_batch.py`'s manifest batch path, and the worker daemon's
+   `FlowWorker.process_task`; consolidated onto the recorder in #283 after
+   shipping as three near-identical module-level copies) checks
+   `is_media_recorded()` and raises before any download if the driver
+   returned a `flow_media_id` already recorded for the profile.
+   Separately, a `DataIntegrityError` from the recorder's
+   `UNIQUE(profile_name, flow_media_id)` constraint now escalates to
+   `MediaAttributionError` (naming the suspect file) instead of being caught
+   by the generic `DataStoreError` warn-only path.
+
+Precedent for this class of fix: the `--model` silent no-op entry below (same
+section) — an error the user sees beats a wrong artifact reported as success.
+
+**Related, but distinct.** [#282](https://github.com/ffroliva/gflow-cli/issues/282)
+fixed a separate defect in the same media-picker surface (`--ref <uuid>`
+selection failing on any ref after the first once the virtualised
+(react-virtuoso) grid needed to scroll to render it) — a picker-navigation
+bug, not a data-integrity one. [#174](https://github.com/ffroliva/gflow-cli/issues/174)
+(open, in the "Open" section above) is a Flow-side full-page media-library
+UI rollout that breaks entity attach on affected accounts — a different
+code path, but the same general theme that the media-picker surface needs
+ongoing hardening.
+
+**Residual risk (post-fix, not fully closed).** The two-pass baseline settle
+narrows the window, it doesn't remove it: the agentic poll loop still stops
+scraping the moment the new-UUID count on a single scrape equals the
+requested count. A pre-existing tile that lazy-renders *after* the 0.5s
+baseline settle but *before* the real generation actually completes
+(generations take 30–60s) lands inside that window at exactly the expected
+count — the ambiguity fail-fast in layer 2 only triggers on an *excess* of
+new UUIDs, so it never sees this case. Layer 3's pre-download guard and
+collision escalation then only catch it if the misattributed asset happens
+to already be in **local** history for the profile — an asset created in the
+Flow web UI, generated on another machine, or recorded under a different
+profile DB has no local history row to collide with, so it can still slip
+through all three layers: wrong file on disk, exit 0. Mitigations until this
+is closed: run generations in a dedicated, low-asset project (fewer
+pre-existing tiles means a smaller lazy-render population to collide with),
+and visually verify anchor/canonical images before referencing them
+downstream in `i2i`. The stable-break hardening shipped post-v0.32.0 (#283 /
+PR #292): the loop now requires the SAME new-UUID set on two consecutive
+scrapes at the expected count before trusting it, which narrows this window
+to a pre-existing tile that lazy-renders AND holds stable across two 0.5s
+scrapes at exactly the expected count (or first hits the count on the final
+poll before the 180s deadline). Narrowed, not closed — the dedicated-project
+mitigation still applies.
+
+**Known gap: the shell multi-prompt path records no history at all.**
+`gflow run --config <file>` and `gflow image t2i` with multiple prompts
+(positional, `--prompts-file`, or `--stdin`) both go through
+`image_batch.run_image_batch` / `run_one_image_prompt`, which never opens an
+`OperationRecorder` or calls `record_generated_images` — no local history row
+is written for these runs at all. Layer 1 (the agentic driver's two-pass
+baseline settle + ambiguity fail-fast in `await_images`) still applies since
+it lives in the transport, independent of recording. Layers 2 and 3
+(`verify_media_attribution`'s pre-download guard and the post-download
+collision escalation) both depend on local history via
+`OperationRecorder.is_media_recorded()` / `record_generated_images()`, so
+neither guard exists on this path — this is a pre-existing gap, not a
+regression from this fix. `gflow image batch` (the manifest path, via
+`run_manifest_image_batch`) already threads a recorder through and is covered
+by all three layers. Accepted low-risk gap (#283 closed with this noted as
+un-shipped remainder; re-file if it bites in practice).
+
+**Workaround (pre-fix):** none — on an affected version, manually verify the
+downloaded file matches the prompt before trusting a `t2i`/`i2i` result.
+
+---
+
+### Profile named `default` is opaque — no Google account identity
+
+- **Status:** Resolved · **Severity:** Was-Low (UX confusion, no data loss) · **Was-affecting:** all versions through v0.9.x · **Fixed in:** v0.10.0 via PR #110 (2026-05-28) · **Tracked:** issue #92
+
+The first-run default profile name `default` gave no indication of which Google
+account it belonged to, what locale it used, or whether it was valid. On
+developer machines with multiple Google Pro/Ultra accounts, this caused confusion
+when test profiles, expired sessions, or stale `gflow auth login` runs silently
+wrote to the wrong directory.
+
+**Resolution:** `gflow auth login` now writes a `.gflow_account` file to the
+profile directory immediately after the session is verified. `profile_store.list_profiles()`
+surfaces this as `ProfileMeta.google_account`, and `gflow auth list` (both table
+and `--json`) now includes a **Google account** column. The first-run `default`
+profile is automatically renamed to the email local-part (e.g. `profile_your-name`)
+once the email is known, and `config.toml` is updated atomically.
+
+Profiles created before this fix continue to work and display `unknown` in the
+account column. Re-running `gflow auth login` against an existing profile backfills
+the `.gflow_account` file.
+
+See [AUTHENTICATION.md § Profile naming](AUTHENTICATION.md#profile-naming) for the
+new naming convention and [AUTHENTICATION.md § gflow auth list](AUTHENTICATION.md#gflow-auth-list)
+for the updated `--json` schema.
+
+---
+
+### `gflow image t2i/i2i --model` was a silent no-op on `ui_automation`
+
+- **Status:** Resolved · **Severity:** Was-Medium (wrong model = wrong cost + quality, silently) · **Was-affecting:** v0.7.0 through v0.8.1 · **Fixed in:** develop post-v0.8.1 via PR #48 (2026-05-24)
+
+Pre-fix, `gflow image t2i --model nano-banana-2` (or any other model) under
+`ui_automation` would set the wire-level model field correctly but **never
+click the model picker in the editor UI**, so Flow used whichever model the
+UI's dropdown was last set to (typically the account default). Users got
+their requested model silently substituted for the default — no error, just
+wrong output and wrong credit cost. Fixed by `_select_image_model` in
+`src/gflow_cli/api/transports/ui_automation.py` which mirrors the new
+`_select_video_model` helper. If you ran `gflow image t2i --model <X>`
+against v0.7.0–v0.8.1 and noticed the output didn't match `<X>`, this is
+why; re-run on the next release (≥ v0.9.0).
+
+---
+
+### aisandbox-pa generation 401 — bypassed by the `ui_automation` transport
+
+- **Status:** Resolved · **Severity:** Was-High (blocked image gen via HTTP transports) · **Fixed in:** v0.7.0
+
+The two long Open-section entries above (*Image generation returns HTTP 401* and *REST API 401 — all `aisandbox-pa.googleapis.com` generation endpoints blocked*) were closed by the same architectural change: `UiAutomationTransport` drives the Flow web UI so Flow's own JavaScript issues every generation request with the full browser auth context (cookies, reCAPTCHA, `Origin`/`Referer` headers). The 401 had affected every direct HTTP call from `evaluate_fetch` / `bearer` / `sapisidhash`; those transports now live under `src/gflow_cli/api/transports/experimental/` and are not on the production path.
+
+End-to-end live-verified on the `ffroliva` profile across `9:16`, `16:9`, `1:1`, and `4:3` aspect ratios; see [`docs/LIVE_VERIFICATION_v0.7.0.md`](https://github.com/ffroliva/gflow-cli/blob/main/docs/LIVE_VERIFICATION_v0.7.0.md) for timing, file sizes, and exact filenames. Video T2V uses the same approach (Phase A — PR #23 — merged 2026-05-19).
+
+---
+
+### G12 "browser not secure" block — Google rejects automated sign-in
+
+- **Status:** Resolved · **Severity:** Critical (blocked `gflow auth login`) · **Fixed in:** v0.6.0a2 · **Mitigation reimplemented + re-measured:** 2026-09-08
+
+Google's sign-in flow (`accounts.google.com/v3/signin/rejected`) rejects a browser that
+advertises itself as automated, and refuses the login with no user-facing error.
+
+**Root cause (timing race):** Without `--disable-blink-features=AutomationControlled`,
+Blink's C++ engine sets `navigator.webdriver = true` as a non-configurable, non-writable
+native property at Chrome startup — before any JavaScript (including `add_init_script`)
+can run. The `Object.defineProperty` override silently fails. With the flag, the property
+is never set; the JS override then works as belt-and-suspenders.
+
+**Resolution:** `gflow auth login` launches the system's real Google Chrome through
+Playwright's `channel="chrome"` with `chromium_sandbox=True`, `no_viewport=True`, and both
+stealth flags — `--disable-blink-features=AutomationControlled` and
+`ignore_default_args=["--enable-automation"]`. Because gflow owns that browser it also
+detects the completed Flow sign-in and closes the window itself; see
+[docs/AUTHENTICATION.md](AUTHENTICATION.md). When no Chrome channel resolves, or
+Google rejects the browser anyway, login falls back automatically to launching Chrome as a
+plain subprocess and waiting for you to close the window. There is no flag and no choice to
+make, and closing the window yourself works on either path.
+
+> **This entry described that Playwright implementation long before it existed.**
+> It read *"`v0.6.0a2` adds `RealChromeStrategy` — launches the system's real Google Chrome
+> via Playwright's `channel="chrome"` with stealth flags."* `src/gflow_cli/auth/real_chrome.py`
+> was created at `eb0de133` (2026-07-19) as a bare `subprocess.Popen` passive capture, and
+> `git log -S'channel="chrome"' -- src/gflow_cli/auth/` returned **zero** commits until the
+> auto-close change. The paragraph above is the same shape restated deliberately as current
+> fact, not the same accident left standing.
+
+```bash
+# Ask for real Chrome explicitly:
+gflow auth login --browser chrome
+
+# Or rely on auto-detection (default behaviour; picks real Chrome if installed):
+gflow auth login
+```
+
+**The block is current Google behaviour — "Resolved" means the mitigation holds, not that
+Google stopped.** Re-measured 2026-09-08 across three throwaway *unauthenticated* profiles,
+each signed into by hand
+([spike](https://github.com/ffroliva/gflow-cli/blob/main/docs/superpowers/spikes/2026-09-08-g12-blocks-webdriver-not-playwright.md)): a
+browser advertising `navigator.webdriver === true` — real Chrome, no stealth flags — was
+rejected at `/v3/signin/rejected` **17.5 s** into the flow, while the same real Chrome
+*with* the flags reported `false`, never saw the rejection, and reached a Flow session
+cookie at 59.4 s. Playwright's bundled Chromium with the flags passed too, so the binary is
+not the discriminator; `navigator.webdriver` tracked the outcome in all three arms.
+
+> **This is N=1 — do not read it as a capability claim.** One account, one Windows host, one
+> residential IP, one Chrome build (`Chrome/149.0.0.0`), one day. Google's sign-in risk
+> scoring varies with account age and IP reputation, so it does not predict CI, a VPS, or a
+> fresh account. Every arm ran headed, so it says nothing about headless in either
+> direction. Sign-in is also a different gate from generation's reCAPTCHA Enterprise check;
+> a result on one does not move the other.
+
+The Chrome window no longer shows the "You are using an unsupported command-line flag"
+notice this entry used to warn about: that banner came from the `--no-sandbox` Playwright
+injects by default, and `chromium_sandbox=True` stops the injection.
+
+---
+
+### v0.1 — provider methods are stubs
+
+- **Status:** Resolved · **Severity:** Critical (blocked usage) · **Fixed in:** v0.2.0a1
+
+The v0.1 scaffold left `upload_image`, `start_generation`, `get_job`, `download` raising `NotImplementedError`. v0.2.0a1 wired the video routes (T2V/I2V/batch) on a new `gflow_cli.api.client.FlowApiClient` and removed the legacy `providers/` + `models` modules. v0.3.0a1 added the image routes (`gflow image upload/t2i/i2i`) on the same client.
+
+---
+
+## Reporting a new issue
+
+If you hit something not listed here:
+
+1. Search existing issues at <https://github.com/ffroliva/gflow-cli/issues>.
+2. If none match, open a new issue with:
+   - `gflow-cli` version (`gflow --version`)
+   - Python version (`python --version`)
+   - OS + version
+   - Exact command that failed + full error output
+   - What you expected vs. what happened
+3. For **security issues**, see [docs/SECURITY.md § Reporting](SECURITY.md#reporting) — email instead of public issue.

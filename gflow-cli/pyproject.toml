@@ -1,0 +1,189 @@
+[project]
+name = "gflow-cli"
+version = "0.73.2"
+description = "Unofficial CLI for Google Flow — drive Veo image-to-video generations from the terminal."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [{ name = "Flavio Oliva", email = "ffroliva@gmail.com" }]
+keywords = ["google", "flow", "veo", "video", "ai", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+]
+
+dependencies = [
+    "click>=8.1.0",
+    "httpx>=0.27.0",
+    # Upper bound is mandatory, not cosmetic. playwright is not an ordinary
+    # library here: it ships the browser driver, and 100% of gflow's product
+    # surface is automation through it, so an untested playwright minor is an
+    # untested product. Observed 2026-08-03: an install that resolved 1.62.0
+    # (the lockfile pinned 1.59.0, and `uv tool install <path>` ignores the
+    # lockfile) made every `video i2v` run hang SILENTLY right after the frame
+    # upload — browser alive, no error, no timeout; downgrading to 1.59.0 fixed
+    # it instantly. 1.62.0 therefore stays EXCLUDED until someone reproduces
+    # that hang against it deliberately and finds the cause.
+    # Raised 1.59.0 -> 1.61.0 on 2026-08-05. The floor is the version actually
+    # exercised by CI and the lockfile: >=1.45.0 was aspirational, nothing has
+    # ever been tested there.
+    # The range keeps 1.61.x patch headroom (so a CVE fix does not require a
+    # gflow release) while excluding untested minors; the patchright extra
+    # below pins exactly for the same reason. Raise this deliberately, after
+    # live-verifying a generation on the new minor — offline tests cannot see
+    # a driver-behaviour regression (`resolve-drift` in CI only smoke-imports).
+    "playwright>=1.61.0,<1.62.0",
+    "rich>=13.7.0",
+    "pydantic-settings>=2.5.0",
+    "platformdirs>=4.0.0",
+    "structlog>=24.0.0",
+    "tenacity>=8.2",
+    "browser-cookie3>=0.20.1",
+    # MCP server + daemon layer (gflow serve / gflow mcp).
+    # Upper bound is mandatory, not cosmetic: the MCP SDK ships breaking
+    # protocol-era changes on major bumps. 2.0.0 deleted `mcp.server.fastmcp`
+    # outright, so an unbounded `mcp>=1.0.0` silently broke every fresh install
+    # of the MCP surface while CI stayed green on the lockfile. The
+    # `resolve-drift` CI job installs from these ranges (no lockfile) so the
+    # next such break is caught by CI instead of by users.
+    "mcp>=2.0.0,<3",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "sse-starlette>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff==0.16.6",
+    "pyright>=1.1.0",
+    # video-chain: the last-frame extractor (media.py) decodes with PyAV, and its
+    # tests build synthetic mp4 fixtures with numpy. Declared here so the dev/CI
+    # env actually runs tests/test_media.py instead of importorskip-skipping it.
+    "av>=12",
+    "numpy>=1.24",
+]
+# Cloud storage extras — install only one at a time.
+# aiobotocore and boto3 pin conflicting botocore versions; avoid mixing [s3]
+# with any package that pulls in boto3 (AWS CLI, CDK, SAM, etc.).
+# Use pipx or a dedicated venv: pipx install 'gflow-cli[s3]'
+gcs = [
+    "universal_pathlib>=0.2.5",
+    "gcsfs>=2024.2.0",
+]
+s3 = [
+    "universal_pathlib>=0.2.5",
+    "s3fs>=2024.2.0",
+]
+# Video-chain extra — PyAV for the last-frame extractor (no system ffmpeg needed).
+chain = [
+    "av>=12",
+]
+# Patchright engine extra — opt-in, drop-in patched Playwright (Chromium) that
+# avoids the Runtime.enable CDP leak on the headed path. Selected via
+# GFLOW_CLI_BROWSER_ENGINE=patchright. Ships a PATCHED Chromium driver that
+# handles live Google session cookies/Bearer/SAPISID, so it is EXACT-pinned and
+# treated as a security-review-required bump (NOT a dependabot auto-merge) —
+# see SECURITY.md. Not a headless unlock.
+patchright = [
+    "patchright==1.61.2",
+]
+
+[project.scripts]
+gflow = "gflow_cli.cli:main"
+flow = "gflow_cli.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/ffroliva/gflow-cli"
+Issues = "https://github.com/ffroliva/gflow-cli/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gflow_cli"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# T20 (flake8-print) bans builtin `print()` in src/ — AGENTS.md mandates structlog
+# only. `console.print()` (rich) is an attribute call and is unaffected. Tests and
+# CLI scripts legitimately print, so they are exempted via per-file-ignores below.
+select = ["E", "F", "W", "I", "B", "UP", "N", "T20"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["T20"]
+"scripts/**" = ["T20"]
+"eval/**" = ["T20"]
+# skills/ ships runnable helper tools alongside each SKILL.md; a CLI helper prints.
+"skills/**" = ["T20"]
+
+[tool.pyright]
+include = ["src", "tests"]
+strict = ["src/gflow_cli"]
+pythonVersion = "3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# Pin pytest's tmp_path basetemp under the repo's gitignored tmp/ dir so
+# tests never pollute the project root (or other CWDs) with pytest-of-<user>/
+# fixtures.  Without this, pytest falls back to `tempfile.gettempdir()` which
+# can be CWD on some Windows shells (e.g. msys2 sets TMPDIR=$PWD), leaving
+# stray pytest-of-*/ directories in the repo root.
+addopts = "--basetemp=tmp/pytest -m 'not e2e and not live and not smoke and not containers'"
+markers = [
+    "unit: pure logic, no I/O (the default category)",
+    "integration: real Provider plumbing with mocked HTTP",
+    "containers: requires Docker daemon; opt-in via -m containers",
+    "live: hits the real Flow API — opt-in via GFLOW_LIVE=1",
+    # -----------------------------------------------------------------------
+    # e2e: tests that touch the real Google Flow API / real browser sessions.
+    # Always require GFLOW_CLI_E2E_PROFILE and opt-in via -m e2e.
+    # Use cost sub-markers for selective execution (see docs/E2E_TESTING.md).
+    # -----------------------------------------------------------------------
+    "e2e: real Flow API tests; require GFLOW_CLI_E2E_PROFILE env var; opt-in via -m e2e",
+    # Cost sub-markers (each test carries 'e2e' PLUS one or more of these):
+    "e2e_auth: auth/session/health tests — zero credits, needs browser only",
+    "e2e_image: image generation (Imagen) — ZERO credits; subject to a daily cap",
+    "e2e_video: spends Veo credits (text-to-video or image-to-video) — slowest",
+    "e2e_batch: batch image generation — ZERO credits; consumes more of the daily image cap",
+    "e2e_data: verifies data-layer (SQLite) persistence — combines with e2e_image or e2e_video",
+    "e2e_scene: scene/timeline compose (Add Clip) — zero credits, no reCAPTCHA",
+    "e2e_character: Character entity create (face/body image-gen + entity patch) — ZERO credits; opt-in via GFLOW_CLI_E2E_RUN_CHARACTER",
+    "smoke: golden-path live test (image gen — ZERO credits); opt-in via GFLOW_CLI_E2E_PROFILE",
+]
+
+[dependency-groups]
+dev = [
+    "av>=12",
+    "detect-secrets>=1.5.0",
+    "jsonschema>=4",
+    "numpy>=1.24",
+    "pillow>=12.3.0",
+    "pyright>=1.1.409",
+    "pytest-asyncio>=1.3.0",
+    "pytest-bdd>=8.1.0",
+    "pytest-cov>=7.1.0",
+    "ruff==0.16.6",
+]
+# Container-based integration tests — requires Docker daemon.
+# Install: uv sync --group containers
+# Run:     uv run --group containers pytest -m containers tests/integration/
+containers = [
+    { include-group = "dev" },
+    "testcontainers>=4.8.0",
+    "s3fs>=2024.2.0",
+    "gcsfs>=2024.2.0",
+    "universal_pathlib>=0.2.5",
+]

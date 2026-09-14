@@ -1,0 +1,127 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# uv
+.uv-cache/
+
+# Test / coverage
+.pytest_cache/
+pytest-of-*/
+.coverage
+.coverage.*
+coverage.xml
+pytest-*.xml
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+.pyright/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Project-specific — secrets / session storage (NEVER commit)
+# NOTE: git does NOT support trailing inline comments in .gitignore — a `#` only
+# starts a comment at the START of a line. Keep each pattern on its own line so
+# the comment text isn't folded into the pattern (which silently un-ignores it).
+/auth/
+profile_*/
+*.cookies.json
+storage_state.json
+secrets.json
+.env
+.env.local
+.env.*.local
+
+# Runtime state written into this repo by tools run FROM this directory.
+# social-publisher's queue defaults to a RELATIVE path (its cli.py: SP_QUEUE_DB,
+# default "state/queue.sqlite"), so invoking it — or its MCP server — with this repo
+# as CWD silently creates state/queue.sqlite here. On 2026-09-07 that produced a
+# second, EMPTY queue that a dry-run then read and reported as "nothing pending",
+# while the real queue sat in social-publisher/state/. Untracked and unignored, it
+# was also one `git add -A` from being committed.
+state/
+
+# Generated outputs
+out/
+tmp/
+gflow-output/
+*.mp4
+*.png
+*.jpg
+*.jpeg
+!docs/**/*.png         # docs images are OK
+!tests/fixtures/**/*.png
+!test_assets/fixtures/**/*.jpg
+!test_assets/fixtures/**/*.jpeg
+samples/*.captured.json # sandbox-recorded API exchanges may contain PII
+
+# Runtime artefact dirs written by smoke/debug scripts — belong under tmp/ only
+test_assets/smoke_*/
+test_assets/debug_*/
+
+# Phase-2 live-spike capture outputs — NEVER commit (may contain real API payloads)
+scripts/dev/_spike_out/
+
+# HAR captures (GFLOW_CLI_HAR_PATH) — full request/response bodies, headers and
+# auth cookies. The _spike_out rule only covers the default location; a HAR
+# written anywhere else must not be committable either.
+*.har
+
+# Agent session marker — machine/session-local handoff state, regenerated per run
+.continue-here.md
+
+# Live Flow traffic captures — NEVER commit (contain real Bearer tokens / API keys).
+# Diagnostic scripts MUST default-write here, NOT to samples/captured/.
+# Sanitised reference samples (no secrets) can still live under samples/captured/.
+tmp/captured/
+samples/captured/flow_outgoing_*.jsonl
+samples/captured/flow_outgoing_*.json
+
+# Claude Code worktrees and lock files
+.claude/settings.json
+.claude/settings.local.json
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+
+# Doc-council scratch dir (bundles + raw reviews + consensus matrix)
+.doc-council/
+
+worktrees/
+
+# E2E test logs (live Flow runs — may contain account/profile names)
+.planning/e2e-logs/
+
+# Understand Anything (local knowledge graph)
+.understand-anything/
+.worktrees
+
+# Subagent-driven-development scratch (ledger + task reports)
+.superpowers/
+
+# MkDocs build output
+website/site/
+
+# Local git hooks dir (core.hooksPath target) — machine-local tooling, never shipped
+.githooks/
+
+# HAR/DOM spike harness (scripts/dev/har-spike/) — the vendored scripts ARE
+# tracked; everything they generate is not. Captures carry auth cookies, Bearer
+# tokens and prompts, and the npm/agent-browser caches are 34 MB of noise.
+# (No .gitkeep negation here: git never descends into an ignored directory, so a
+# negation for a file inside one is inert. The capture scripts create the dir.)
+scripts/dev/har-spike/artifacts/
+scripts/dev/har-spike/.agent-browser/
+scripts/dev/har-spike/.npm-cache/

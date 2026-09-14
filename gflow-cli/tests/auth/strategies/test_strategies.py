@@ -1,0 +1,851 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from structlog.testing import capture_logs
+
+from gflow_cli.auth.real_chrome import _UNVERIFIED_HINT, _UNVERIFIED_MESSAGE, GEMINI_URL
+from gflow_cli.auth.strategies import InternalChromiumStrategy, RealChromeStrategy
+from gflow_cli.auth.verification import FlowSessionOutcome, FlowSessionStatus
+from gflow_cli.errors import (
+    AuthBrowserRejectedError,
+    AuthLoginTimeoutError,
+    AuthMissingError,
+    SecurityError,
+)
+
+
+def _status(outcome: FlowSessionOutcome, email: str | None = None) -> FlowSessionStatus:
+    """Build a FlowSessionStatus for mocking verify_flow_session."""
+    return FlowSessionStatus(outcome=outcome, user_email=email, source="chrome")
+
+
+def _build_mock_proc() -> MagicMock:
+    """Return a mock asyncio subprocess Process that exits cleanly.
+
+    ``wait`` is async (awaited by the strategy); ``terminate`` / ``kill`` are
+    synchronous on :class:`asyncio.subprocess.Process`.
+    """
+    mock_proc = MagicMock(name="proc")
+    mock_proc.wait = AsyncMock(return_value=0)
+    mock_proc.terminate = MagicMock()
+    mock_proc.kill = MagicMock()
+    return mock_proc
+
+
+def _force_subprocess_path() -> Any:
+    """Pin RealChromeStrategy to its RETAINED subprocess path.
+
+    The default is now the owned-Playwright browser; without this pin these
+    tests would launch a real Chrome on any machine that has one.
+    """
+    return patch(
+        "gflow_cli.auth.real_chrome.is_playwright_chrome_channel_available",
+        return_value=False,
+    )
+
+
+def _record_lease_events(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> None:
+    """Patch ProfileLease.acquire/release to append to ``events`` — no real locks."""
+    from gflow_cli.profile_lease import ProfileLease
+
+    def acq(self: ProfileLease) -> ProfileLease:
+        events.append("acquire")
+        return self
+
+    def rel(self: ProfileLease) -> None:
+        events.append("release")
+
+    monkeypatch.setattr(ProfileLease, "acquire", acq)
+    monkeypatch.setattr(ProfileLease, "release", rel)
+
+
+# ---------------------------------------------------------------------------
+# RealChromeStrategy — Passive Capture (v0.6.0a3)
+# ---------------------------------------------------------------------------
+
+
+class TestRealChromeStrategy:
+    @pytest.mark.asyncio
+    async def test_real_chrome_launch_flags(self, tmp_path: Path) -> None:
+        """Verify Chrome launches WITHOUT --remote-debugging-port or --enable-automation."""
+        strategy = RealChromeStrategy()
+        gflow_home = tmp_path / "gflow_home"
+        profile_dir = gflow_home / "profile_default"
+        gflow_home.mkdir()
+
+        mock_proc = _build_mock_proc()
+        mock_create = AsyncMock(return_value=mock_proc)
+        fake_chrome = r"C:\fake\chrome.exe"
+        verified = _status(FlowSessionOutcome.AUTHENTICATED, "test@example.com")
+
+        with (
+            patch("gflow_cli.auth.real_chrome.get_settings") as mock_settings,
+            _force_subprocess_path(),
+            patch("gflow_cli.auth.real_chrome.find_chrome_executable", return_value=fake_chrome),
+            patch("gflow_cli.auth.real_chrome.asyncio.create_subprocess_exec", mock_create),
+            patch(
+                "gflow_cli.auth.real_chrome.verify_flow_profile",
+                AsyncMock(return_value=verified),
+            ),
+        ):
+            mock_settings.return_value.home = gflow_home
+            await strategy.login(profile_dir, headless=False)
+
+        args_list = mock_create.call_args.args
+        assert args_list[0] == fake_chrome
+        assert f"--user-data-dir={profile_dir}" in args_list
+        assert "--password-store=basic" in args_list
+        assert "--enable-automation" not in args_list
+        assert not any("--remote-debugging-port" in a for a in args_list)
+        assert GEMINI_URL in args_list  # Chrome opens directly on the Flow page
+        # Login window matches the generation viewport (#315 consistency).
+        assert "--window-size=1920,1080" in args_list
+
+    @pytest.mark.asyncio
+    async def test_real_chrome_success_writes_marker(self, tmp_path: Path) -> None:
+        """On an authenticated Flow session, login writes the .gflow_browser_strategy marker."""
+        strategy = RealChromeStrategy()
+        gflow_home = tmp_path / "gflow_home"
+        profile_dir = gflow_home / "profile_default"
+        gflow_home.mkdir()
+
+        mock_proc = _build_mock_proc()
+        verified = _status(FlowSessionOutcome.AUTHENTICATED, "test@example.com")
+
+        with (
+            patch("gflow_cli.auth.real_chrome.get_settings") as mock_settings,
+            _force_subprocess_path(),
+            patch(
+                "gflow_cli.auth.real_chrome.find_chrome_executable",
+                return_value=r"C:\fake\chrome.exe",
+            ),
+            patch(
+                "gflow_cli.auth.real_chrome.asyncio.create_subprocess_exec",
+                AsyncMock(return_value=mock_proc),
+            ),
+            patch(
+                "gflow_cli.auth.real_chrome.verify_flow_profile",
+                AsyncMock(return_value=verified),
+            ),
+        ):
+            mock_settings.return_value.home = gflow_home
+            await strategy.login(profile_dir, headless=False)
+
+        marker = profile_dir / ".gflow_browser_strategy"
+        assert marker.exists()
+        assert marker.read_text(encoding="utf-8") == "chrome"
+        account_file = profile_dir / ".gflow_account"
+        assert account_file.exists(), ".gflow_account must be written on successful login"
+        assert account_file.read_text(encoding="utf-8") == "test@example.com"
+
+    @pytest.mark.asyncio
+    async def test_real_chrome_lease_released_before_verification(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The passive-capture profile lease wraps ONLY the running Chrome and is
+        released BEFORE verify_flow_profile runs (which owns its own probe lease
+        on the same profile — a nested lease would be a same-process
+        double-acquire) (D3)."""
+        strategy = RealChromeStrategy()
+        gflow_home = tmp_path / "gflow_home"
+        profile_dir = gflow_home / "profile_default"
+        gflow_home.mkdir()
+
+        events: list[str] = []
+        _record_lease_events(monkeypatch, events)
+
+        async def _verify(*_a: object, **_k: object) -> FlowSessionStatus:
+            events.append("verify")
+            return _status(FlowSessionOutcome.AUTHENTICATED, "test@example.com")
+
+        with (
+            patch("gflow_cli.auth.real_chrome.get_settings") as mock_settings,
+            _force_subprocess_path(),
+            patch(
+                "gflow_cli.auth.real_chrome.find_chrome_executable",
+                return_value=r"C:\fake\chrome.exe",
+            ),
+            patch(
+                "gflow_cli.auth.real_chrome.asyncio.create_subprocess_exec",
+                AsyncMock(return_value=_build_mock_proc()),
+            ),
+            patch("gflow_cli.auth.real_chrome.verify_flow_profile", _verify),
+        ):
+            mock_settings.return_value.home = gflow_home
+            await strategy.login(profile_dir, headless=False)
+
+        # Lease acquired then released around Chrome, THEN verification runs.
+        assert events == ["acquire", "release", "verify"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            FlowSessionOutcome.GOOGLE_SESSION_ONLY,
+            FlowSessionOutcome.NO_SESSION,
+            FlowSessionOutcome.VERIFICATION_ERROR,
+        ],
+    )
+    async def test_real_chrome_unverified_raises_auth_missing(
+        self, tmp_path: Path, outcome: FlowSessionOutcome
+    ) -> None:
+        """A non-authenticated outcome fails the login with AuthMissingError."""
+        strategy = RealChromeStrategy()
+        gflow_home = tmp_path / "gflow_home"
+        profile_dir = gflow_home / "profile_default"
+        gflow_home.mkdir()
+
+        mock_proc = _build_mock_proc()
+
+        with (
+            patch("gflow_cli.auth.real_chrome.get_settings") as mock_settings,
+            _force_subprocess_path(),
+            patch(
+                "gflow_cli.auth.real_chrome.find_chrome_executable",
+                return_value=r"C:\fake\chrome.exe",
+            ),
+            patch(
+                "gflow_cli.auth.real_chrome.asyncio.create_subprocess_exec",
+                AsyncMock(return_value=mock_proc),
+            ),
+            patch(
+                "gflow_cli.auth.real_chrome.verify_flow_profile",
+                AsyncMock(return_value=_status(outcome)),
+            ),
+        ):
+            mock_settings.return_value.home = gflow_home
+            with pytest.raises(AuthMissingError) as exc_info:
+                await strategy.login(profile_dir, headless=False)
+
+        assert exc_info.value.detail == _UNVERIFIED_MESSAGE[outcome]
+        assert exc_info.value.remediation_hint == _UNVERIFIED_HINT[outcome]
+        assert not (profile_dir / ".gflow_browser_strategy").exists()
+
+    @pytest.mark.asyncio
+    async def test_real_chrome_preserves_preexisting_marker_on_transient_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """A re-login on a previously-verified chrome profile that hits a
+        transient VERIFICATION_ERROR must NOT delete the pre-existing marker —
+        otherwise channel_for_profile stops returning 'chrome' and FlowApiClient
+        downgrades to bundled Chromium on a real-Chrome profile."""
+        strategy = RealChromeStrategy()
+        gflow_home = tmp_path / "gflow_home"
+        profile_dir = gflow_home / "profile_default"
+        profile_dir.mkdir(parents=True)
+        # Profile was verified-chrome on a previous successful login.
+        marker = profile_dir / ".gflow_browser_strategy"
+        marker.write_text("chrome", encoding="utf-8")
+
+        mock_proc = _build_mock_proc()
+
+        with (
+            patch("gflow_cli.auth.real_chrome.get_settings") as mock_settings,
+            _force_subprocess_path(),
+            patch(
+                "gflow_cli.auth.real_chrome.find_chrome_executable",
+                return_value=r"C:\fake\chrome.exe",
+            ),
+            patch(
+                "gflow_cli.auth.real_chrome.asyncio.create_subprocess_exec",
+                AsyncMock(return_value=mock_proc),
+            ),
+            patch(
+                "gflow_cli.auth.real_chrome.verify_flow_profile",
+                AsyncMock(return_value=_status(FlowSessionOutcome.VERIFICATION_ERROR)),
+            ),
+        ):
+            mock_settings.return_value.home = gflow_home
+            with pytest.raises(AuthMissingError):
+                await strategy.login(profile_dir, headless=False)
+
+        # The marker the profile already had must survive the transient failure.
+        assert marker.exists(), "pre-existing chrome marker must survive a transient failure"
+        assert marker.read_text(encoding="utf-8") == "chrome"
+
+    @pytest.mark.asyncio
+    async def test_real_chrome_marker_rollback_is_logged(self, tmp_path: Path) -> None:
+        """#644: rolling the speculative marker back must be observable.
+
+        The rollback flips ``channel_for_profile`` away from 'chrome', which
+        silently downgrades generation to bundled Chromium. It previously
+        emitted nothing at all, so the first real occurrence was visible only
+        as a user report weeks later.
+        """
+        strategy = RealChromeStrategy()
+        gflow_home = tmp_path / "gflow_home"
+        profile_dir = gflow_home / "profile_default"
+        gflow_home.mkdir()
+
+        with (
+            patch("gflow_cli.auth.real_chrome.get_settings") as mock_settings,
+            _force_subprocess_path(),
+            patch(
+                "gflow_cli.auth.real_chrome.find_chrome_executable",
+                return_value=r"C:\fake\chrome.exe",
+            ),
+            patch(
+                "gflow_cli.auth.real_chrome.asyncio.create_subprocess_exec",
+                AsyncMock(return_value=_build_mock_proc()),
+            ),
+            patch(
+                "gflow_cli.auth.real_chrome.verify_flow_profile",
+                AsyncMock(return_value=_status(FlowSessionOutcome.VERIFICATION_ERROR)),
+            ),
+            capture_logs() as logs,
+        ):
+            mock_settings.return_value.home = gflow_home
+            with pytest.raises(AuthMissingError):
+                await strategy.login(profile_dir, headless=False)
+
+        rollbacks = [e for e in logs if e.get("event") == "auth_chrome_marker_rolled_back"]
+        assert len(rollbacks) == 1, f"expected exactly one rollback event, got {logs}"
+        # The outcome separates "the probe endpoint was unreachable" from
+        # "genuinely signed out" — the #644 discriminator. It is an enum value,
+        # never response content, so it cannot carry a token or cookie.
+        assert rollbacks[0]["outcome"] == FlowSessionOutcome.VERIFICATION_ERROR.value
+
+    @pytest.mark.asyncio
+    async def test_real_chrome_no_rollback_event_when_marker_survives(self, tmp_path: Path) -> None:
+        """No rollback happened, so no rollback event — the signal must stay rare."""
+        strategy = RealChromeStrategy()
+        gflow_home = tmp_path / "gflow_home"
+        profile_dir = gflow_home / "profile_default"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / ".gflow_browser_strategy").write_text("chrome", encoding="utf-8")
+
+        with (
+            patch("gflow_cli.auth.real_chrome.get_settings") as mock_settings,
+            _force_subprocess_path(),
+            patch(
+                "gflow_cli.auth.real_chrome.find_chrome_executable",
+                return_value=r"C:\fake\chrome.exe",
+            ),
+            patch(
+                "gflow_cli.auth.real_chrome.asyncio.create_subprocess_exec",
+                AsyncMock(return_value=_build_mock_proc()),
+            ),
+            patch(
+                "gflow_cli.auth.real_chrome.verify_flow_profile",
+                AsyncMock(return_value=_status(FlowSessionOutcome.VERIFICATION_ERROR)),
+            ),
+            capture_logs() as logs,
+        ):
+            mock_settings.return_value.home = gflow_home
+            with pytest.raises(AuthMissingError):
+                await strategy.login(profile_dir, headless=False)
+
+        assert not [e for e in logs if e.get("event") == "auth_chrome_marker_rolled_back"]
+
+    @pytest.mark.asyncio
+    async def test_real_chrome_privacy_guard(self, tmp_path: Path) -> None:
+        """Verify SecurityError when profile_dir is outside GFLOW_CLI_HOME."""
+        strategy = RealChromeStrategy()
+        gflow_home = tmp_path / "gflow_home"
+        gflow_home.mkdir()
+        outside_dir = tmp_path / "system_chrome_profile"
+        outside_dir.mkdir()
+
+        with patch("gflow_cli.auth.real_chrome.get_settings") as mock_settings:
+            mock_settings.return_value.home = gflow_home
+            with pytest.raises(SecurityError) as excinfo:
+                await strategy.login(outside_dir, headless=False)
+
+        assert "outside of GFLOW_CLI_HOME" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_real_chrome_timeout_raises(self, tmp_path: Path) -> None:
+        """AuthLoginTimeoutError raised when asyncio.wait_for times out.
+
+        Mocks asyncio.wait_for to raise asyncio.TimeoutError, simulating the
+        case where the user never closes Chrome within timeout_seconds.
+        """
+        strategy = RealChromeStrategy(timeout_seconds=0)
+        gflow_home = tmp_path / "gflow_home"
+        profile_dir = gflow_home / "profile_default"
+        gflow_home.mkdir()
+
+        mock_proc = _build_mock_proc()
+
+        async def _raise_timeout(awaitable: object, *_a: object, **_kw: object) -> None:
+            # wait_for normally consumes the awaitable; close the un-awaited
+            # proc.wait() coroutine so it doesn't emit a RuntimeWarning.
+            close = getattr(awaitable, "close", None)
+            if callable(close):
+                close()
+            raise TimeoutError
+
+        with (
+            patch("gflow_cli.auth.real_chrome.get_settings") as mock_settings,
+            _force_subprocess_path(),
+            patch(
+                "gflow_cli.auth.real_chrome.find_chrome_executable",
+                return_value=r"C:\fake\chrome.exe",
+            ),
+            patch(
+                "gflow_cli.auth.real_chrome.asyncio.create_subprocess_exec",
+                AsyncMock(return_value=mock_proc),
+            ),
+            patch("gflow_cli.auth.real_chrome.asyncio.wait_for", side_effect=_raise_timeout),
+        ):
+            mock_settings.return_value.home = gflow_home
+            with pytest.raises(AuthLoginTimeoutError) as excinfo:
+                await strategy.login(profile_dir, headless=False)
+
+        assert "0s" in str(excinfo.value)
+        mock_proc.terminate.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# InternalChromiumStrategy
+# ---------------------------------------------------------------------------
+
+
+class TestInternalChromiumStrategy:
+    @pytest.mark.asyncio
+    async def test_internal_chromium_standard_behavior(self, tmp_path: Path) -> None:
+        """Internal Chromium detects success via the /api/auth/session probe."""
+        strategy = InternalChromiumStrategy()
+        gflow_home = tmp_path / "gflow_home"
+        gflow_home.mkdir()
+        profile_dir = gflow_home / "profile_internal"
+
+        mock_resp = MagicMock(name="resp")
+        mock_resp.status = 200
+        mock_resp.text = AsyncMock(return_value='{"user": {"email": "test@example.com"}}')
+
+        mock_page = MagicMock(name="page")
+        # Mirror the runtime contract: the strategy has just navigated to GEMINI_URL,
+        # so the page IS on the Flow host. Left as a bare MagicMock attribute this is
+        # not a str, the poll's host guard reads "still mid-OAuth" and the loop spins
+        # until the 600 s timeout instead of polling once.
+        mock_page.url = "https://labs.google/fx/tools/flow"
+        mock_page.goto = AsyncMock()
+        # Explicit, because a bare MagicMock attribute is TRUTHY: left unset,
+        # `page.is_closed()` reports "the user already closed the window" on the
+        # first poll and the loop breaks before doing anything under test.
+        mock_page.is_closed = MagicMock(return_value=False)
+        mock_page.request.get = AsyncMock(return_value=mock_resp)
+
+        mock_ctx = MagicMock(name="ctx")
+        mock_ctx.pages = [mock_page]
+        mock_ctx.cookies = AsyncMock(return_value=[{"name": "SAPISID", "value": "x"}])
+        mock_ctx.close = AsyncMock()
+        mock_ctx.new_page = AsyncMock(return_value=mock_page)
+
+        mock_pw_obj = MagicMock(name="pw")
+        mock_launch_pctx = AsyncMock(return_value=mock_ctx)
+        mock_pw_obj.chromium.launch_persistent_context = mock_launch_pctx
+
+        mock_cm = MagicMock(name="cm")
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_pw_obj)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+        mock_ap = MagicMock(name="async_playwright", return_value=mock_cm)
+
+        with (
+            patch("gflow_cli.auth.internal_chromium.get_settings") as mock_settings,
+            patch("gflow_cli.auth.strategies.async_playwright", mock_ap),
+            patch("asyncio.sleep", AsyncMock()),
+        ):
+            mock_settings.return_value.home = gflow_home
+            await strategy.login(profile_dir, headless=False)
+
+        _, kwargs = mock_launch_pctx.call_args
+        assert "channel" not in kwargs or kwargs["channel"] != "chrome"
+        launch_args = kwargs.get("args", [])
+        # G12 stealth flags. Measured 2026-09-08 (docs/superpowers/spikes/
+        # 2026-09-08-g12-blocks-webdriver-not-playwright.md): without them
+        # navigator.webdriver is True and Google routes to /v3/signin/rejected
+        # in 17.5s; with them both real Chrome and bundled Chromium signed in.
+        assert "--disable-blink-features=AutomationControlled" in launch_args
+        assert kwargs.get("ignore_default_args") == ["--enable-automation"]
+        # Playwright defaults chromium_sandbox=False, injecting --no-sandbox —
+        # an extra automation signal plus Chrome's unsupported-flag banner.
+        assert kwargs.get("chromium_sandbox") is True
+        # #315: log in at the size generation runs at — through the REAL OS
+        # window. An explicit viewport makes Playwright emulate that size and
+        # pushes Google's sign-in form off-screen on smaller/scaled displays.
+        assert "--window-size=1920,1080" in launch_args
+        assert kwargs.get("no_viewport") is True
+        assert "viewport" not in kwargs
+        # Load-bearing beyond auth: macOS keychain prompt on the profile (#222).
+        assert "--password-store=basic" in launch_args
+        mock_page.request.get.assert_awaited()
+        account_file = profile_dir / ".gflow_account"
+        assert account_file.exists(), ".gflow_account must be written on successful login"
+        assert account_file.read_text(encoding="utf-8") == "test@example.com"
+
+    @pytest.mark.asyncio
+    async def test_internal_chromium_wraps_launch_in_profile_lease(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Internal Chromium login owns the profile: acquire before launch,
+        release after the login context closes (D3)."""
+        strategy = InternalChromiumStrategy()
+        gflow_home = tmp_path / "gflow_home"
+        gflow_home.mkdir()
+        profile_dir = gflow_home / "profile_internal"
+
+        events: list[str] = []
+        _record_lease_events(monkeypatch, events)
+
+        mock_resp = MagicMock(name="resp")
+        mock_resp.status = 200
+        mock_resp.text = AsyncMock(return_value='{"user": {"email": "test@example.com"}}')
+        mock_page = MagicMock(name="page")
+        # Mirror the runtime contract: the strategy has just navigated to GEMINI_URL,
+        # so the page IS on the Flow host. Left as a bare MagicMock attribute this is
+        # not a str, the poll's host guard reads "still mid-OAuth" and the loop spins
+        # until the 600 s timeout instead of polling once.
+        mock_page.url = "https://labs.google/fx/tools/flow"
+        mock_page.goto = AsyncMock()
+        # Explicit, because a bare MagicMock attribute is TRUTHY: left unset,
+        # `page.is_closed()` reports "the user already closed the window" on the
+        # first poll and the loop breaks before doing anything under test.
+        mock_page.is_closed = MagicMock(return_value=False)
+        mock_page.request.get = AsyncMock(return_value=mock_resp)
+        mock_ctx = MagicMock(name="ctx")
+        mock_ctx.pages = [mock_page]
+        mock_ctx.cookies = AsyncMock(return_value=[{"name": "SAPISID", "value": "x"}])
+        mock_ctx.close = AsyncMock()
+        mock_ctx.new_page = AsyncMock(return_value=mock_page)
+
+        async def _launch(*_a: object, **_k: object) -> MagicMock:
+            events.append("launch")
+            return mock_ctx
+
+        mock_pw_obj = MagicMock(name="pw")
+        mock_pw_obj.chromium.launch_persistent_context = AsyncMock(side_effect=_launch)
+        mock_cm = MagicMock(name="cm")
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_pw_obj)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+        mock_ap = MagicMock(name="async_playwright", return_value=mock_cm)
+
+        with (
+            patch("gflow_cli.auth.internal_chromium.get_settings") as mock_settings,
+            patch("gflow_cli.auth.strategies.async_playwright", mock_ap),
+            patch("asyncio.sleep", AsyncMock()),
+        ):
+            mock_settings.return_value.home = gflow_home
+            await strategy.login(profile_dir, headless=False)
+
+        assert events == ["acquire", "launch", "release"]
+
+    @pytest.mark.asyncio
+    async def test_internal_chromium_timeout_raises(self, tmp_path: Path) -> None:
+        """AuthLoginTimeoutError is raised when the session never authenticates."""
+        strategy = InternalChromiumStrategy(timeout_seconds=0)
+        gflow_home = tmp_path / "gflow_home"
+        gflow_home.mkdir()
+        profile_dir = gflow_home / "profile_internal"
+
+        mock_resp = MagicMock(name="resp")
+        mock_resp.status = 200
+        mock_resp.text = AsyncMock(return_value="{}")
+
+        mock_page = MagicMock(name="page")
+        # Mirror the runtime contract: the strategy has just navigated to GEMINI_URL,
+        # so the page IS on the Flow host. Left as a bare MagicMock attribute this is
+        # not a str, the poll's host guard reads "still mid-OAuth" and the loop spins
+        # until the 600 s timeout instead of polling once.
+        mock_page.url = "https://labs.google/fx/tools/flow"
+        mock_page.goto = AsyncMock()
+        # Explicit, because a bare MagicMock attribute is TRUTHY: left unset,
+        # `page.is_closed()` reports "the user already closed the window" on the
+        # first poll and the loop breaks before doing anything under test.
+        mock_page.is_closed = MagicMock(return_value=False)
+        mock_page.request.get = AsyncMock(return_value=mock_resp)
+
+        mock_ctx = MagicMock(name="ctx")
+        mock_ctx.pages = [mock_page]
+        mock_ctx.cookies = AsyncMock(return_value=[])
+        mock_ctx.close = AsyncMock()
+        mock_ctx.new_page = AsyncMock(return_value=mock_page)
+
+        mock_pw_obj = MagicMock(name="pw")
+        mock_pw_obj.chromium.launch_persistent_context = AsyncMock(return_value=mock_ctx)
+
+        mock_cm = MagicMock(name="cm")
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_pw_obj)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+        mock_ap = MagicMock(name="async_playwright", return_value=mock_cm)
+
+        with (
+            patch("gflow_cli.auth.internal_chromium.get_settings") as mock_settings,
+            patch("gflow_cli.auth.strategies.async_playwright", mock_ap),
+            patch("asyncio.sleep", AsyncMock()),
+        ):
+            mock_settings.return_value.home = gflow_home
+            with pytest.raises(AuthLoginTimeoutError) as excinfo:
+                await strategy.login(profile_dir, headless=False)
+
+        assert "0s" in str(excinfo.value)
+        mock_ctx.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_internal_chromium_rejected_browser_raises_guidance(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Google's rejected-browser page should fail fast with Chrome guidance."""
+        strategy = InternalChromiumStrategy(timeout_seconds=600)
+        gflow_home = tmp_path / "gflow_home"
+        gflow_home.mkdir()
+        profile_dir = gflow_home / "profile_internal"
+
+        mock_success_loc = MagicMock()
+        mock_success_loc.is_visible = AsyncMock(return_value=False)
+
+        mock_page = MagicMock(name="page")
+        mock_page.url = "https://accounts.google.com/v3/signin/rejected?continue=flow"
+        mock_page.goto = AsyncMock()
+        # Explicit, because a bare MagicMock attribute is TRUTHY: left unset,
+        # `page.is_closed()` reports "the user already closed the window" on the
+        # first poll and the loop breaks before doing anything under test.
+        mock_page.is_closed = MagicMock(return_value=False)
+        mock_page.get_by_text.return_value = mock_success_loc
+
+        mock_ctx = MagicMock(name="ctx")
+        mock_ctx.pages = [mock_page]
+        mock_ctx.cookies = AsyncMock(return_value=[])
+        mock_ctx.close = AsyncMock()
+        mock_ctx.new_page = AsyncMock(return_value=mock_page)
+
+        mock_pw_obj = MagicMock(name="pw")
+        mock_pw_obj.chromium.launch_persistent_context = AsyncMock(return_value=mock_ctx)
+
+        mock_cm = MagicMock(name="cm")
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_pw_obj)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+        mock_ap = MagicMock(name="async_playwright", return_value=mock_cm)
+
+        with (
+            patch("gflow_cli.auth.internal_chromium.get_settings") as mock_settings,
+            patch("gflow_cli.auth.strategies.async_playwright", mock_ap),
+            patch("asyncio.sleep", AsyncMock()),
+        ):
+            mock_settings.return_value.home = gflow_home
+            with pytest.raises(AuthBrowserRejectedError) as excinfo:
+                await strategy.login(profile_dir, headless=False)
+
+        # This used to assert the hint said "--browser chrome" / "GFLOW_CLI_AUTH_BROWSER=chrome",
+        # i.e. "you picked the wrong binary, pick Chrome". The 2026-09-08 spike disproved
+        # that: bundled Chromium signed in fine WITH the anti-automation flags, and real
+        # Chrome was rejected WITHOUT them. Pinning the old advice would have kept a
+        # now-wrong remediation on the one exit code whose whole job is to explain this.
+        # Assert the cause, which is what stays true.
+        hint = excinfo.value.remediation_hint
+        assert hint is not None
+        assert "navigator.webdriver" in hint
+        assert "gflow auth login" in hint
+        mock_ctx.close.assert_called_once()
+
+
+class TestRaiseOnCloseDefault:
+    """`raise_on_close` defaults to True, and that default is load-bearing.
+
+    The keyword was added so the chrome strategy could treat a hand-closed window as
+    "fall through to the on-disk probe" rather than an error. `InternalChromiumStrategy`
+    keeps the opposite contract: it has no second probe to fall through to, so a browser
+    closed before the Flow sign-in completes must raise. Nothing pinned that default —
+    flipping it to False left the whole auth suite green while silently turning a failed
+    login into a reported success with no `.gflow_account` written.
+    """
+
+    @pytest.mark.asyncio
+    async def test_closed_before_auth_raises_by_default(self) -> None:
+        from playwright.async_api import Error as PlaywrightError
+
+        from gflow_cli.auth.internal_chromium import poll_session_until_authenticated
+
+        page = MagicMock(name="page")
+        page.url = "https://labs.google/fx/tools/flow"
+        page.is_closed = MagicMock(return_value=True)
+        page.request.get = AsyncMock(side_effect=PlaywrightError("Target closed"))
+
+        ctx = MagicMock(name="ctx")
+        ctx.cookies = AsyncMock(return_value=[])
+
+        with pytest.raises(AuthLoginTimeoutError) as excinfo:
+            # No `raise_on_close=` — the default is the thing under test.
+            await poll_session_until_authenticated(ctx, page, 600, "internal")
+
+        assert "closed" in str(excinfo.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_closed_before_auth_returns_none_when_opted_out(self) -> None:
+        from playwright.async_api import Error as PlaywrightError
+
+        from gflow_cli.auth.internal_chromium import poll_session_until_authenticated
+
+        page = MagicMock(name="page")
+        page.url = "https://labs.google/fx/tools/flow"
+        page.is_closed = MagicMock(return_value=True)
+        page.request.get = AsyncMock(side_effect=PlaywrightError("Target closed"))
+
+        ctx = MagicMock(name="ctx")
+        ctx.cookies = AsyncMock(return_value=[])
+
+        assert (
+            await poll_session_until_authenticated(ctx, page, 600, "chrome", raise_on_close=False)
+            is None
+        )
+
+
+class TestSessionPollStaysOffTheOAuthHandshake:
+    """The session poll must not touch `/fx/api/auth/session` mid-OAuth.
+
+    Observed live 2026-09-08: a sign-in driven through the owned browser landed on
+    `labs.google/fx/api/auth/signin?error=OAuthCallback` and then timed out at 600 s.
+    `/fx/api/auth/session` is a NextAuth route that can rotate session cookies, and the
+    poll was hitting it every 3 s for the whole login — including while Google held the
+    page for the callback. The spike that signed in successfully twice never made this
+    request at all: it read the cookie jar locally over CDP. This pins that property.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_session_request_while_on_google(self) -> None:
+        from gflow_cli.auth.internal_chromium import poll_session_until_authenticated
+
+        page = MagicMock(name="page")
+        # Mid-handshake on Google's host, not Flow's.
+        page.url = "https://accounts.google.com/v3/signin/challenge/pwd?flow=1"
+        page.is_closed = MagicMock(return_value=False)
+        page.request.get = AsyncMock()
+
+        ctx = MagicMock(name="ctx")
+        ctx.cookies = AsyncMock(return_value=[])
+
+        with patch("gflow_cli.auth.internal_chromium.asyncio.sleep", AsyncMock()):
+            # timeout_seconds=0 would skip the loop entirely; give it a real budget and
+            # let the patched sleep spin it, then assert on what it did NOT do.
+            with pytest.raises(AuthLoginTimeoutError):
+                await poll_session_until_authenticated(ctx, page, 1, "chrome")
+
+        page.request.get.assert_not_awaited()
+        ctx.cookies.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_session_request_resumes_once_back_on_flow(self) -> None:
+        from gflow_cli.auth.internal_chromium import poll_session_until_authenticated
+
+        resp = MagicMock(name="resp")
+        resp.status = 200
+        resp.text = AsyncMock(
+            return_value='{"user":{"email":"test@example.com"},"expires":"2099-01-01"}'
+        )
+
+        page = MagicMock(name="page")
+        page.url = "https://labs.google/fx/tools/flow"
+        page.is_closed = MagicMock(return_value=False)
+        page.request.get = AsyncMock(return_value=resp)
+
+        ctx = MagicMock(name="ctx")
+        ctx.cookies = AsyncMock(return_value=[{"name": "SAPISID", "value": "x"}])
+
+        with patch("gflow_cli.auth.internal_chromium.asyncio.sleep", AsyncMock()):
+            email = await poll_session_until_authenticated(ctx, page, 5, "chrome")
+
+        assert email == "test@example.com"
+        page.request.get.assert_awaited()
+
+    @pytest.mark.parametrize(
+        ("url", "safe"),
+        [
+            ("https://labs.google/fx/tools/flow", True),
+            ("https://flow.google.com/project/abc", True),
+            # NextAuth runs the callback on the APP's origin, so a host check alone
+            # sails straight through the one phase this guard exists to protect.
+            ("https://labs.google/fx/api/auth/callback/google?state=S&code=C", False),
+            ("https://labs.google/fx/api/auth/signin?error=OAuthCallback", False),
+            ("https://accounts.google.com/v3/signin/identifier", False),
+            # `urlparse(...).hostname` raises ValueError here; an earlier version let
+            # that escape into the loop's catch-all, which reported "browser closed"
+            # for a browser that was open.
+            ("https://[bad", False),
+            ("about:blank", False),
+        ],
+    )
+    def test_session_probe_is_gated_on_route_not_just_host(self, url: str, safe: bool) -> None:
+        """The probe gate must exclude NextAuth's own auth routes, not only Google's host."""
+        from gflow_cli.auth.internal_chromium import _is_safe_to_probe_session
+
+        page = MagicMock(name="page")
+        page.url = url
+        assert _is_safe_to_probe_session(page) is safe
+
+    def test_session_probe_rejects_a_bare_mock_url(self) -> None:
+        """A bare MagicMock attribute is truthy — it must not read as a Flow host."""
+        from gflow_cli.auth.internal_chromium import _is_safe_to_probe_session
+
+        assert _is_safe_to_probe_session(MagicMock(name="page")) is False
+
+    @pytest.mark.asyncio
+    async def test_close_during_2fa_is_noticed_immediately(self) -> None:
+        """Closing the window mid-2FA must end the poll, not run to the deadline.
+
+        The host guard `continue`s without touching Playwright, so on Google's host
+        nothing ever raises and the reactive `except PlaywrightError -> is_closed()`
+        detection never fires. Measured before the liveness check: a full run to the
+        deadline with the session endpoint touched 0 times — a user who abandoned a
+        2FA challenge after 30 s would wait the whole 600 s for exit 12.
+        """
+        from gflow_cli.auth.internal_chromium import poll_session_until_authenticated
+
+        page = MagicMock(name="page")
+        # Abandoned mid-challenge: still on Google's host, window gone.
+        page.url = "https://accounts.google.com/v3/signin/challenge/totp?x=1"
+        page.is_closed = MagicMock(return_value=True)
+        page.request.get = AsyncMock()
+
+        ctx = MagicMock(name="ctx")
+        ctx.cookies = AsyncMock(return_value=[])
+
+        # A SMALL deadline on purpose. The passing path returns instantly, so the
+        # value only matters when this regresses — and then it decides whether CI
+        # fails in seconds or hangs for the full production timeout. Verified by
+        # neutering the check: the run spins to the deadline, so 600 here would be
+        # a ten-minute hang instead of a red test.
+        with patch("gflow_cli.auth.internal_chromium.asyncio.sleep", AsyncMock()):
+            assert (
+                await poll_session_until_authenticated(ctx, page, 5, "chrome", raise_on_close=False)
+                is None
+            )
+
+        # Never reached the session endpoint, and never waited out the deadline.
+        page.request.get.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_migrated_host_still_polls(self) -> None:
+        """A migrated account lands on flow.google.com and must still be detected.
+
+        The labs app `location.replace`s a migrated account onto flow.google.com right
+        after the callback returns. Gating the poll on labs alone would go False there
+        and never come back, reproducing the 600 s timeout this guard exists to fix —
+        on every account the maintainer actually owns.
+        """
+        from gflow_cli.auth.internal_chromium import poll_session_until_authenticated
+
+        resp = MagicMock(name="resp")
+        resp.status = 200
+        resp.text = AsyncMock(
+            return_value='{"user":{"email":"test@example.com"},"expires":"2099-01-01"}'
+        )
+
+        page = MagicMock(name="page")
+        page.url = "https://flow.google.com/project/abc123"
+        page.is_closed = MagicMock(return_value=False)
+        page.request.get = AsyncMock(return_value=resp)
+
+        ctx = MagicMock(name="ctx")
+        ctx.cookies = AsyncMock(return_value=[{"name": "SAPISID", "value": "x"}])
+
+        with patch("gflow_cli.auth.internal_chromium.asyncio.sleep", AsyncMock()):
+            email = await poll_session_until_authenticated(ctx, page, 5, "chrome")
+
+        assert email == "test@example.com"
+        page.request.get.assert_awaited()
