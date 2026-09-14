@@ -214,7 +214,7 @@ async def run_stdio() -> None:
         )
 
 
-async def run_http(host: str = "127.0.0.1", port: int = 8000) -> None:
+async def run_http(host: str = "127.0.0.1", port: int = 8000, api_port: int | None = None) -> None:
     """Run the MCP server over Streamable HTTP (the current spec transport).
 
     This is the default entry point for ``gflow serve``. Streamable HTTP
@@ -246,11 +246,22 @@ async def run_http(host: str = "127.0.0.1", port: int = 8000) -> None:
 
     _register_surfaces()
 
-    await server.run_streamable_http_async(
-        host=host,
-        port=port,
-        streamable_http_path=HTTP_PATH,
-    )
+    async def run_mcp() -> None:
+        await server.run_streamable_http_async(
+            host=host,
+            port=port,
+            streamable_http_path=HTTP_PATH,
+        )
+
+    if api_port is None:
+        await run_mcp()
+        return
+
+    # The REST facade intentionally shares this process with MCP.  That keeps
+    # one profile lease, one FlowWorker and one rate limiter for both clients.
+    from gflow_cli.api_adapter import run_api
+
+    await asyncio.gather(run_mcp(), run_api(host, api_port))
 
 
 async def run_sse(host: str = "127.0.0.1", port: int = 8000) -> None:
@@ -289,9 +300,9 @@ def main_stdio() -> None:
     asyncio.run(run_stdio())
 
 
-def main_http(host: str = "127.0.0.1", port: int = 8000) -> None:
+def main_http(host: str = "127.0.0.1", port: int = 8000, api_port: int | None = None) -> None:
     """Synchronous wrapper for ``run_http`` — called by Click."""
-    asyncio.run(run_http(host=host, port=port))
+    asyncio.run(run_http(host=host, port=port, api_port=api_port))
 
 
 def main_sse(host: str = "127.0.0.1", port: int = 8000) -> None:

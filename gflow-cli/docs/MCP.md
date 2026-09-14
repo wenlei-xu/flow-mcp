@@ -275,6 +275,27 @@ gflow serve --port 8000 --host 127.0.0.1 --profile default --no-spend
 This serves the MCP server over **Streamable HTTP**, the current spec transport:
 * **Endpoint:** `http://127.0.0.1:8000/mcp`
 
+### OpenAI-compatible REST facade
+
+Browser workbenches that already speak the OpenAI image/video API can use the
+facade without implementing MCP. Start it in the same gflow process:
+
+```bash
+gflow serve --port 8000 --api-port 8001 --host 127.0.0.1
+```
+
+The facade shares the same Chrome profile, queue, rate limiter, and worker as
+MCP. Its endpoints are `GET /v1/models`, `POST /v1/videos` with polling via
+`GET /v1/videos/{id}` and download via `GET /v1/videos/{id}/content`, plus
+`POST /v1/images/generations` and `POST /v1/images/edits`.
+
+For a browser client, configure the OpenAI channel Base URL as the public
+gflow host (the client appends `/v1`). Set `GFLOW_API_KEY` when the facade is
+reachable beyond localhost, `GFLOW_API_CORS_ORIGINS` to the trusted workbench
+origins, `GFLOW_API_PROJECT` for a default migrated-Flow project, and
+`GFLOW_API_PUBLIC_BASE_URL` when image URLs need a stable public origin behind
+a reverse proxy or Cloudflare Tunnel.
+
 The legacy HTTP+SSE transport is still available for one deprecation cycle:
 ```bash
 gflow serve --transport sse --port 8000   # deprecated; logs a warning
@@ -294,10 +315,10 @@ transport bookkeeping we want to keep.
 
 Non-loopback binds (e.g. `--host 0.0.0.0`) require `GFLOW_DAEMON_TOKEN` to be set.
 
-> **Note:** the background `FlowWorker` queue manager and the REST `/api/v1`
-> surface are built as internal foundation but are **not yet wired into**
-> `gflow serve` — it currently runs the MCP/SSE server only. See the
-> [CHANGELOG](../CHANGELOG.md) for the roadmap.
+The REST facade is opt-in through `--api-port`; omitting that flag preserves the
+MCP-only daemon behavior. The facade accepts local reference images as
+multipart uploads and returns an asynchronous video task, so a browser client
+does not put image Base64 into the generation request.
 
 ---
 

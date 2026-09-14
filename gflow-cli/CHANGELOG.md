@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Added an optional `gflow serve --api-port` OpenAI-compatible REST facade that
+  shares the MCP daemon's Chrome profile, queue, rate limiter, and result files.
+
 ## [0.73.2] — 2026-09-12
 
 ### Fixed

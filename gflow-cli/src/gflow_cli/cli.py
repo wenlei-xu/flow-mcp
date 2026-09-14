@@ -624,6 +624,12 @@ def mcp_setup(target: str) -> None:
 @main.command()
 @click.option("--port", default=8000, show_default=True, help="Port to bind the daemon to.")
 @click.option(
+    "--api-port",
+    default=None,
+    type=int,
+    help="Optional OpenAI-compatible REST facade port. It shares the MCP daemon process.",
+)
+@click.option(
     "--host",
     default="127.0.0.1",
     show_default=True,
@@ -638,19 +644,27 @@ def mcp_setup(target: str) -> None:
     help="MCP HTTP transport. 'sse' is deprecated by the MCP 2026-07-28 spec.",
 )
 @_no_spend_option
-def serve(port: int, host: str, profile: str | None, transport: str, no_spend: bool) -> None:
+def serve(
+    port: int,
+    api_port: int | None,
+    host: str,
+    profile: str | None,
+    transport: str,
+    no_spend: bool,
+) -> None:
     """Start the gflow MCP server over HTTP.
 
     \b
     Foundation for Gflow Studio and external API consumers:
       • MCP Streamable HTTP at /mcp — the current spec transport (default)
       • MCP-SSE at /sse — DEPRECATED (--transport sse), one cycle only
-      • REST /api/v1/* — CRUD + generation queue (planned)
+      • OpenAI-compatible REST facade at /v1/* when --api-port is provided
       • Background FlowWorker — sequential generation (planned)
 
     \b
     Example:
       gflow serve --port 8000
+      gflow serve --port 8000 --api-port 8001
       gflow serve --transport sse --port 8000   # deprecated transport
       gflow serve --host 0.0.0.0 --port 8000  # requires GFLOW_DAEMON_TOKEN
     """
@@ -667,6 +681,8 @@ def serve(port: int, host: str, profile: str | None, transport: str, no_spend: b
             sys.exit(11)
 
     if transport == "sse":
+        if api_port is not None:
+            raise click.UsageError("--api-port requires the default Streamable HTTP transport.")
         console.print(
             f"\n[bold]🎬 gflow daemon[/bold] starting on [cyan]{host}:{port}[/cyan]\n"
             f"  MCP-SSE: [cyan]http://{host}:{port}/sse[/cyan]\n"
@@ -684,9 +700,10 @@ def serve(port: int, host: str, profile: str | None, transport: str, no_spend: b
     console.print(
         f"\n[bold]🎬 gflow daemon[/bold] starting on [cyan]{host}:{port}[/cyan]\n"
         f"  MCP (Streamable HTTP): [cyan]http://{host}:{port}{HTTP_PATH}[/cyan]\n"
+        + (f"  OpenAI REST API: [cyan]http://{host}:{api_port}/v1[/cyan]\n" if api_port else "")
     )
 
-    main_http(host=host, port=port)
+    main_http(host=host, port=port, api_port=api_port)
 
 
 if __name__ == "__main__":
