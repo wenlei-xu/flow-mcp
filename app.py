@@ -1655,16 +1655,25 @@ def _openai_task_status(status: str) -> str:
     }.get(status, status)
 
 
-def _openai_video_response(task: dict[str, Any]) -> dict[str, Any]:
+def _absolute_media_url(value: str | None, request: Request | None = None) -> str | None:
+    if not value:
+        return value
+    if request is not None and value.startswith("/"):
+        return f"{str(request.base_url).rstrip('/')}{value}"
+    return value
+
+
+def _openai_video_response(task: dict[str, Any], request: Request | None = None) -> dict[str, Any]:
     public = _public_task(task)
     result = public.get("result") if isinstance(public.get("result"), dict) else {}
     files = result.get("files", []) if isinstance(result, dict) else []
     data = [
-        {"url": item.get("preview_url"), "mime_type": "video/mp4"}
+        {"url": _absolute_media_url(item.get("preview_url"), request), "mime_type": "video/mp4"}
         for item in files
         if isinstance(item, dict) and item.get("preview_url")
     ]
-    return {
+    video_url = data[0]["url"] if data else None
+    response = {
         "id": task["id"],
         "object": "video.generation",
         "status": _openai_task_status(str(task.get("status", "queued"))),
@@ -1678,6 +1687,21 @@ def _openai_video_response(task: dict[str, Any]) -> dict[str, Any]:
         "error": task.get("error") if task.get("status") not in {"succeeded", "queued", "running", "cancelling"} else None,
         "task": public,
     }
+    if video_url:
+        # The Canvas OpenAI adapter checks these fields before falling back to
+        # GET /content. Keep both names for OpenAI-compatible clients.
+        response["url"] = video_url
+        response["video_url"] = video_url
+        response["content"] = {"url": video_url, "video_url": video_url}
+    return response
+
+
+async def _store_openai_video_image(upload: UploadFile) -> str:
+    stored = await upload_asset(upload)
+    record = _asset_record(str(stored["asset_id"]))
+    if record is None:
+        raise HTTPException(status_code=502, detail="参考图已上传但无法读取资产记录")
+    return str(record["path"])
 
 
 @app.post("/v1/images/generations")
@@ -1754,6 +1778,86 @@ async def openai_image_edits(
     return _openai_images_response(task)
 
 
+@app.post("/v1/videos", status_code=202)
+async def openai_standard_videos(
+    request: Request,
+    prompt: str = Form(..., min_length=1, max_length=20_000),
+    model: str | None = Form(default=None),
+    seconds: int | None = Form(default=None),
+    size: str = Form(default="9:16"),
+    mode: str = Form(default="frames"),
+    profile: str | None = Form(default=None),
+    project: str | None = Form(default=None),
+    first_frame: UploadFile | None = File(default=None),
+    last_frame: UploadFile | None = File(default=None),
+    images: list[UploadFile] | None = File(default=None, alias="image[]"),
+    single_image: UploadFile | None = File(default=None, alias="image"),
+    videos: list[UploadFile] | None = File(default=None, alias="video[]"),
+    audios: list[UploadFile] | None = File(default=None, alias="audio[]"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    """OpenAI-compatible multipart video creation endpoint.
+
+    Infinite Canvas follows the standard ``POST /v1/videos`` contract and
+    sends reference frames as multipart files. The studio's older
+    ``/v1/videos/generations`` endpoint is JSON-only, so keeping this adapter
+    here avoids forcing clients to know the internal studio route.
+    """
+    _check_gateway_auth(request)
+    if videos or audios:
+        raise HTTPException(status_code=400, detail="当前 gflow 视频接口只支持图片参考帧")
+
+    uploaded = list(images or [])
+    if single_image is not None:
+        uploaded.append(single_image)
+    image_paths: list[str] = []
+    for upload in uploaded:
+        image_paths.append(await _store_openai_video_image(upload))
+
+    first_path = await _store_openai_video_image(first_frame) if first_frame is not None else None
+    last_path = await _store_openai_video_image(last_frame) if last_frame is not None else None
+    if first_path is None and image_paths and mode != "reference":
+        first_path = image_paths[0]
+    if last_path is None and len(image_paths) > 1 and mode != "reference":
+        last_path = image_paths[1]
+
+    normalized_mode = str(mode or "frames").lower()
+    if normalized_mode == "reference" or len(image_paths) > 2:
+        generation_mode: Literal["t2v", "i2v", "r2v"] = "r2v"
+        reference_images = image_paths
+        initial_frame = None
+        end_frame = None
+    elif first_path is not None:
+        generation_mode = "i2v"
+        reference_images = []
+        initial_frame = first_path
+        end_frame = last_path
+    else:
+        generation_mode = "t2v"
+        reference_images = []
+        initial_frame = None
+        end_frame = None
+
+    task = await create_generation(
+        GenerationRequest(
+            kind="video",
+            prompt=prompt,
+            model=model,
+            aspect=_aspect_from_size(size),
+            duration=seconds,
+            mode=generation_mode,
+            initial_frame=initial_frame,
+            end_frame=end_frame,
+            reference_images=reference_images,
+            profile=profile,
+            project=project or None,
+            wait=False,
+            idempotency_key=idempotency_key,
+        )
+    )
+    return _openai_video_response(task, request)
+
+
 @app.post("/v1/videos/generations")
 async def openai_videos(payload: OpenAIGenerationRequest, request: Request, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
     _check_gateway_auth(request)
@@ -1765,7 +1869,7 @@ async def openai_videos(payload: OpenAIGenerationRequest, request: Request, idem
         profile=payload.profile, project=payload.project, idempotency_key=idempotency_key or payload.idempotency_key, wait=False,
     )
     task = await create_generation(generation)
-    return _openai_video_response(task)
+    return _openai_video_response(task, request)
 
 
 async def _openai_generation_lookup(task_id: str, request: Request) -> dict[str, Any]:
@@ -1773,7 +1877,33 @@ async def _openai_generation_lookup(task_id: str, request: Request) -> dict[str,
     task = _load_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="生成任务不存在")
-    return _openai_video_response(task)
+    return _openai_video_response(task, request)
+
+
+@app.get("/v1/videos/{task_id}/content")
+async def openai_video_content(task_id: str, request: Request) -> Response:
+    """Serve a completed video for clients that use the OpenAI content path."""
+    _check_gateway_auth(request)
+    task = _load_task(task_id)
+    if task is None or task.get("kind") != "video":
+        raise HTTPException(status_code=404, detail="视频任务不存在")
+    if task.get("status") != "succeeded":
+        raise HTTPException(status_code=404, detail="视频结果尚未就绪")
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    files = result.get("files", []) if isinstance(result, dict) else []
+    path_value = None
+    for item in files if isinstance(files, list) else []:
+        value = item.get("path") or item.get("local_path") or item.get("uri") if isinstance(item, dict) else item
+        if value:
+            path_value = str(value)
+            break
+    if not path_value:
+        raise HTTPException(status_code=404, detail="视频结果文件不存在")
+    if path_value.startswith(("s3://", "gs://")):
+        if not _configured_cloud_path(path_value):
+            raise HTTPException(status_code=404, detail="视频结果不在允许的云端存储目录")
+        return StreamingResponse(_cloud_media_stream(path_value), media_type="video/mp4")
+    return FileResponse(_resolve_media_path(path_value), media_type="video/mp4", filename=f"{task_id}.mp4")
 
 
 @app.get("/v1/videos/generations/{task_id}")
@@ -1785,13 +1915,13 @@ async def openai_video_status(task_id: str, request: Request) -> dict[str, Any]:
 @app.post("/v1/videos/generations/{task_id}/cancel")
 async def openai_video_cancel(task_id: str, request: Request) -> dict[str, Any]:
     _check_gateway_auth(request)
-    return _openai_video_response(await cancel_generation(task_id))
+    return _openai_video_response(await cancel_generation(task_id), request)
 
 
 @app.post("/v1/videos/generations/{task_id}/retry")
 async def openai_video_retry(task_id: str, request: Request) -> dict[str, Any]:
     _check_gateway_auth(request)
-    return _openai_video_response(await retry_generation(task_id))
+    return _openai_video_response(await retry_generation(task_id), request)
 
 
 @app.get("/v1/generations/{task_id}")

@@ -196,6 +196,60 @@ class StudioSmokeTests(unittest.TestCase):
         self.assertEqual(captured["request"].kind, "image")
         self.assertEqual(len(captured["request"].input_asset_ids), 1)
 
+    def test_openai_video_standard_multipart_route_queues_i2v(self):
+        captured = {}
+
+        async def fake_create_generation(request):
+            captured["request"] = request
+            return {
+                "id": "video-task",
+                "kind": "video",
+                "status": "queued",
+                "progress": 0,
+                "created_at": datetime.now(UTC).isoformat(),
+                "request": request.model_dump(),
+            }
+
+        with patch.object(studio, "_is_loopback", return_value=True), \
+             patch.object(studio, "create_generation", side_effect=fake_create_generation), \
+             TestClient(studio.app) as client:
+            response = client.post(
+                "/v1/videos",
+                data={
+                    "prompt": "a dog runs across the room",
+                    "model": "veo-fast",
+                    "seconds": "8",
+                    "size": "9:16",
+                    "mode": "frames",
+                },
+                files={"first_frame": ("first.png", b"fake-png", "image/png")},
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(captured["request"].kind, "video")
+        self.assertEqual(captured["request"].mode, "i2v")
+        self.assertTrue(captured["request"].initial_frame)
+        self.assertEqual(captured["request"].model, "veo-fast")
+
+    def test_openai_video_content_route_serves_materialized_result(self):
+        video = studio.UPLOAD_DIR / "video-result.mp4"
+        video.write_bytes(b"fake-mp4")
+        task = {
+            "id": "video-task",
+            "kind": "video",
+            "status": "succeeded",
+            "progress": 100,
+            "created_at": datetime.now(UTC).isoformat(),
+            "result": {"files": [str(video)]},
+        }
+        with patch.object(studio, "_is_loopback", return_value=True), \
+             patch.object(studio, "_load_task", return_value=task), \
+             TestClient(studio.app) as client:
+            response = client.get("/v1/videos/video-task/content")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b"fake-mp4")
+
     def test_openai_responses_facade_preserves_async_task_shape(self):
         captured = {}
 
