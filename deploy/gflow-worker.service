@@ -1,0 +1,19 @@
+[Unit]
+Description=gflow studio durable generation worker
+After=gflow-mcp.service
+Requires=gflow-mcp.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=%h/gflow-studio-prototype
+EnvironmentFile=-%h/gflow-studio-prototype/.env
+Environment=PYTHONPATH=%h/gflow-cli/src
+Environment=GFLOW_STUDIO_ROLE=worker
+ExecStart=%h/gflow-cli/.venv/bin/python worker.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=Backup gflow studio state and Chrome profiles
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=%h/gflow-studio-prototype
+EnvironmentFile=-%h/gflow-studio-prototype/.env
+ExecStart=/bin/bash %h/gflow-studio-prototype/deploy/backup.sh

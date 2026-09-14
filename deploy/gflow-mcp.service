@@ -1,0 +1,19 @@
+[Unit]
+Description=gflow-cli MCP Streamable HTTP server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=%h/gflow-cli
+EnvironmentFile=-%h/gflow-studio-prototype/.env
+Environment=PYTHONPATH=%h/gflow-cli/src
+Environment=GFLOW_CLI_LOG_FORMAT=json
+ExecStart=%h/gflow-cli/.venv/bin/python -m gflow_cli.cli serve --host 127.0.0.1 --port 18080 --transport http
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

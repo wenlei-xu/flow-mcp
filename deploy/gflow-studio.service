@@ -1,0 +1,20 @@
+[Unit]
+Description=gflow studio control plane
+After=gflow-mcp.service
+Requires=gflow-mcp.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=%h/gflow-studio-prototype
+EnvironmentFile=-%h/gflow-studio-prototype/.env
+Environment=PYTHONPATH=%h/gflow-cli/src
+Environment=GFLOW_STUDIO_MCP_UPSTREAM_URL=http://127.0.0.1:18080/mcp
+Environment=GFLOW_STUDIO_ROLE=api
+ExecStart=%h/gflow-cli/.venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8090 --workers 1
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

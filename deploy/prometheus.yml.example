@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: gflow-studio
+    metrics_path: /metrics
+    scheme: https
+    static_configs:
+      - targets: [gflow.example.com]
+    authorization:
+      type: Bearer
+      credentials: replace-with-gflow-studio-api-key

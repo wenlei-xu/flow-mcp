@@ -1,0 +1,127 @@
+services:
+  gflow-mcp:
+    build:
+      context: ../..
+      dockerfile: gflow-studio-prototype/deploy/Dockerfile
+    command: ["xvfb-run", "-a", "python", "-m", "gflow_cli.cli", "serve", "--host", "0.0.0.0", "--port", "18080", "--transport", "http"]
+    environment:
+      GFLOW_CLI_HOME: /var/lib/gflow-cli
+      GFLOW_CLI_OUTPUT_DIR: /var/lib/gflow-output
+      GFLOW_CLI_STORAGE_URI: ${GFLOW_CLI_STORAGE_URI:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_REGION: ${AWS_REGION:-auto}
+      AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-}
+      GFLOW_CLI_LOG_FORMAT: json
+      GFLOW_CLI_DAEMON_TOKEN: ${GFLOW_CLI_DAEMON_TOKEN:?set GFLOW_CLI_DAEMON_TOKEN}
+      GFLOW_CLI_GENERATION_RATE_CAPACITY: ${GFLOW_CLI_GENERATION_RATE_CAPACITY:-8}
+      GFLOW_CLI_GENERATION_RATE_REFILL_SECONDS: ${GFLOW_CLI_GENERATION_RATE_REFILL_SECONDS:-20}
+    volumes:
+      - gflow_cli_data:/var/lib/gflow-cli
+      - gflow_output:/var/lib/gflow-output
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket; s=socket.create_connection(('127.0.0.1',18080),3); s.close()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  gflow-studio:
+    build:
+      context: ../..
+      dockerfile: gflow-studio-prototype/deploy/Dockerfile
+    command: ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8090", "--workers", "1"]
+    environment:
+      GFLOW_CLI_HOME: /var/lib/gflow-cli
+      GFLOW_CLI_OUTPUT_DIR: /var/lib/gflow-output
+      GFLOW_CLI_SRC: /opt/gflow-cli/src
+      GFLOW_CLI_STORAGE_URI: ${GFLOW_CLI_STORAGE_URI:-}
+      GFLOW_CLI_GENERATION_RATE_CAPACITY: ${GFLOW_CLI_GENERATION_RATE_CAPACITY:-8}
+      GFLOW_CLI_GENERATION_RATE_REFILL_SECONDS: ${GFLOW_CLI_GENERATION_RATE_REFILL_SECONDS:-20}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_REGION: ${AWS_REGION:-auto}
+      AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-}
+      GFLOW_STUDIO_DB_PATH: /var/lib/gflow-studio/studio.db
+      GFLOW_STUDIO_UPLOAD_DIR: /var/lib/gflow-studio/uploads
+      GFLOW_STUDIO_MCP_UPSTREAM_URL: http://gflow-mcp:18080/mcp
+      GFLOW_STUDIO_ROLE: api
+      GFLOW_STUDIO_API_KEY: ${GFLOW_STUDIO_API_KEY:?set GFLOW_STUDIO_API_KEY}
+      GFLOW_STUDIO_ADMIN_USER: ${GFLOW_STUDIO_ADMIN_USER:-admin}
+      GFLOW_STUDIO_ADMIN_PASSWORD: ${GFLOW_STUDIO_ADMIN_PASSWORD:?set GFLOW_STUDIO_ADMIN_PASSWORD}
+      GFLOW_STUDIO_SESSION_SECRET: ${GFLOW_STUDIO_SESSION_SECRET:?set GFLOW_STUDIO_SESSION_SECRET}
+      GFLOW_STUDIO_MEDIA_SIGNING_SECRET: ${GFLOW_STUDIO_MEDIA_SIGNING_SECRET:?set GFLOW_STUDIO_MEDIA_SIGNING_SECRET}
+      GFLOW_STUDIO_PUBLIC_BASE_URL: ${GFLOW_STUDIO_PUBLIC_BASE_URL:?set GFLOW_STUDIO_PUBLIC_BASE_URL}
+      GFLOW_STUDIO_CORS_ORIGINS: ${GFLOW_STUDIO_CORS_ORIGINS:-http://127.0.0.1:8090,http://localhost:8090}
+      GFLOW_STUDIO_QUEUE_WORKERS: ${GFLOW_STUDIO_QUEUE_WORKERS:-4}
+      GFLOW_STUDIO_IMAGE_WORKERS: ${GFLOW_STUDIO_IMAGE_WORKERS:-8}
+      GFLOW_STUDIO_VIDEO_WORKERS: ${GFLOW_STUDIO_VIDEO_WORKERS:-4}
+      GFLOW_STUDIO_WORKER_LEASE_SECONDS: ${GFLOW_STUDIO_WORKER_LEASE_SECONDS:-45}
+      GFLOW_STUDIO_GENERATION_TIMEOUT_SECONDS: ${GFLOW_STUDIO_GENERATION_TIMEOUT_SECONDS:-1800}
+      GFLOW_STUDIO_MEDIA_TTL_SECONDS: ${GFLOW_STUDIO_MEDIA_TTL_SECONDS:-86400}
+      GFLOW_STUDIO_ASSET_RETENTION_SECONDS: ${GFLOW_STUDIO_ASSET_RETENTION_SECONDS:-604800}
+      GFLOW_STUDIO_ASSET_MAX_BYTES: ${GFLOW_STUDIO_ASSET_MAX_BYTES:-26214400}
+      GFLOW_STUDIO_ASSET_MAX_TOTAL_BYTES: ${GFLOW_STUDIO_ASSET_MAX_TOTAL_BYTES:-2147483648}
+      GFLOW_STUDIO_RATE_LIMIT_PER_MINUTE: ${GFLOW_STUDIO_RATE_LIMIT_PER_MINUTE:-180}
+    ports:
+      - "127.0.0.1:8090:8090"
+    volumes:
+      - gflow_cli_data:/var/lib/gflow-cli
+      - gflow_output:/var/lib/gflow-output
+      - studio_data:/var/lib/gflow-studio
+    depends_on:
+      gflow-mcp:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket; s=socket.create_connection(('127.0.0.1',8090),3); s.close()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  gflow-worker:
+    build:
+      context: ../..
+      dockerfile: gflow-studio-prototype/deploy/Dockerfile
+    command: ["xvfb-run", "-a", "python", "worker.py"]
+    environment:
+      GFLOW_CLI_HOME: /var/lib/gflow-cli
+      GFLOW_CLI_OUTPUT_DIR: /var/lib/gflow-output
+      GFLOW_CLI_SRC: /opt/gflow-cli/src
+      GFLOW_CLI_STORAGE_URI: ${GFLOW_CLI_STORAGE_URI:-}
+      GFLOW_CLI_GENERATION_RATE_CAPACITY: ${GFLOW_CLI_GENERATION_RATE_CAPACITY:-8}
+      GFLOW_CLI_GENERATION_RATE_REFILL_SECONDS: ${GFLOW_CLI_GENERATION_RATE_REFILL_SECONDS:-20}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_REGION: ${AWS_REGION:-auto}
+      AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-}
+      GFLOW_STUDIO_DB_PATH: /var/lib/gflow-studio/studio.db
+      GFLOW_STUDIO_UPLOAD_DIR: /var/lib/gflow-studio/uploads
+      GFLOW_STUDIO_MCP_UPSTREAM_URL: http://gflow-mcp:18080/mcp
+      GFLOW_STUDIO_ROLE: worker
+      GFLOW_STUDIO_QUEUE_WORKERS: ${GFLOW_STUDIO_QUEUE_WORKERS:-4}
+      GFLOW_STUDIO_IMAGE_WORKERS: ${GFLOW_STUDIO_IMAGE_WORKERS:-8}
+      GFLOW_STUDIO_VIDEO_WORKERS: ${GFLOW_STUDIO_VIDEO_WORKERS:-4}
+      GFLOW_STUDIO_WORKER_LEASE_SECONDS: ${GFLOW_STUDIO_WORKER_LEASE_SECONDS:-45}
+      GFLOW_STUDIO_GENERATION_TIMEOUT_SECONDS: ${GFLOW_STUDIO_GENERATION_TIMEOUT_SECONDS:-1800}
+      GFLOW_STUDIO_MEDIA_TTL_SECONDS: ${GFLOW_STUDIO_MEDIA_TTL_SECONDS:-86400}
+      GFLOW_STUDIO_ASSET_RETENTION_SECONDS: ${GFLOW_STUDIO_ASSET_RETENTION_SECONDS:-604800}
+      GFLOW_STUDIO_ASSET_MAX_BYTES: ${GFLOW_STUDIO_ASSET_MAX_BYTES:-26214400}
+      GFLOW_STUDIO_ASSET_MAX_TOTAL_BYTES: ${GFLOW_STUDIO_ASSET_MAX_TOTAL_BYTES:-2147483648}
+      GFLOW_STUDIO_RATE_LIMIT_PER_MINUTE: ${GFLOW_STUDIO_RATE_LIMIT_PER_MINUTE:-180}
+    volumes:
+      - gflow_cli_data:/var/lib/gflow-cli
+      - gflow_output:/var/lib/gflow-output
+      - studio_data:/var/lib/gflow-studio
+    depends_on:
+      gflow-mcp:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  gflow_cli_data:
+  gflow_output:
+  studio_data:

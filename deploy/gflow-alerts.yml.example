@@ -1,0 +1,31 @@
+groups:
+  - name: gflow-studio
+    rules:
+      - alert: GflowNoAvailableProfile
+        expr: gflow_studio_profiles_available == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "gflow 没有可用账号"
+      - alert: GflowQueueStuck
+        expr: gflow_studio_tasks_queued > 0 and gflow_studio_worker_online == 1 and gflow_studio_oldest_queued_age_seconds > 900
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "gflow 队列中的最老任务已等待超过 15 分钟"
+      - alert: GflowGenerationStuck
+        expr: gflow_studio_tasks_running > 0 and gflow_studio_oldest_running_age_seconds > gflow_studio_generation_timeout_seconds
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "gflow 运行中的最老任务已超过生成超时阈值"
+      - alert: GflowWorkerLeaseMissing
+        expr: gflow_studio_tasks_queued > 0 and gflow_studio_worker_online == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "gflow 有排队任务但没有可用 Worker"
