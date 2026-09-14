@@ -129,11 +129,12 @@ def flow_landing_kind(url: object) -> str | None:
     sign-in page. The rejected-browser route keeps returning ``None`` — it has its own
     error and must never read as a missing account or an expired session.
 
-    ``"public"`` is deliberately scoped to the **migrated** host: `/about` was measured
-    there (#756) and nowhere else, and the remediation text names `flow.google.com`.
-    A `labs.google/about` landing would be a different, unmeasured thing, so it stays
-    ``None`` and the caller's own diagnosis stands rather than a message about the
-    wrong host.
+    ``"public"`` is deliberately scoped to the **migrated** host: the public
+    landing pages ``/about`` and ``/`` were measured there (#756) and nowhere
+    else, and the remediation text names ``flow.google.com``. A
+    ``labs.google/about`` landing would be a different, unmeasured thing, so it
+    stays ``None`` and the caller's own diagnosis stands rather than a message
+    about the wrong host.
 
     Not measured, and so not encoded: whether a NextAuth route can carry a locale
     segment (`/fx/pt/api/auth/...`). `routes.py` shows Flow does that for the app's
@@ -176,7 +177,7 @@ def flow_landing_kind(url: object) -> str | None:
         return None
     if path.startswith(_NEXTAUTH_ROUTE_PREFIX):
         return "signin"
-    if host_kind == "migrated" and path.rstrip("/") == "/about":
+    if host_kind == "migrated" and path.rstrip("/") in {"", "/about"}:
         return "public"
     return None
 

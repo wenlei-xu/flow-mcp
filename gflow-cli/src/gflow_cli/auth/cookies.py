@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import sqlite3
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -20,6 +22,8 @@ logger = structlog.get_logger(__name__)
 
 _FLOW_COOKIE_DOMAIN = "labs.google"
 _FLOW_COOKIE_URL = f"https://{_FLOW_COOKIE_DOMAIN}"
+_MIGRATED_FLOW_COOKIE_DOMAIN = "flow.google.com"
+_MIGRATED_FLOW_SESSION_COOKIES = frozenset({"OSID", "__Secure-OSID"})
 _GOOGLE_SESSION_COOKIE = "SAPISID"
 
 
@@ -27,14 +31,16 @@ _GOOGLE_SESSION_COOKIE = "SAPISID"
 class ChromeCookieSnapshot:
     """Cookies needed for the Flow session probe.
 
-    `httpx_cookies` is intentionally limited to cookies scoped to labs.google.
-    `google_session` is derived from the full local jar so verification can
-    still distinguish "Google signed in, Flow app not signed in" without
-    sending broader Google cookies to labs.google.
+    `httpx_cookies` is intentionally limited to the legacy labs.google origin.
+    Migrated accounts use flow.google.com's OSID cookie and are verified from
+    profile metadata plus cookie-store presence when Chrome DPAPI prevents
+    decrypting the values.
     """
 
     httpx_cookies: dict[str, str]
     google_session: bool
+    migrated_session: bool = False
+    user_email: str | None = None
 
 
 def _cookie_field(cookie: object, field: str) -> object:
@@ -50,6 +56,63 @@ def _is_flow_cookie(cookie: Any) -> bool:
         return False
     normalized = domain.lstrip(".").lower()
     return normalized == _FLOW_COOKIE_DOMAIN or normalized.endswith(f".{_FLOW_COOKIE_DOMAIN}")
+
+
+def _is_migrated_flow_cookie(cookie: Any) -> bool:
+    domain = _cookie_field(cookie, "domain")
+    name = _cookie_field(cookie, "name")
+    if not isinstance(domain, str) or not isinstance(name, str):
+        return False
+    normalized = domain.lstrip(".").lower()
+    return normalized == _MIGRATED_FLOW_COOKIE_DOMAIN and name in _MIGRATED_FLOW_SESSION_COOKIES
+
+
+def _has_migrated_flow_session(cookies: Iterable[object]) -> bool:
+    return any(_is_migrated_flow_cookie(cookie) for cookie in cookies)
+
+
+def _profile_account_email(profile_dir: Path) -> str | None:
+    """Read Chrome's non-secret account metadata for migrated profiles."""
+    try:
+        text = profile_dir.joinpath("Default", "Preferences").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    match = re.search(r'"email"\s*:\s*"([^"@\s]+@[^"\s]+)"', text)
+    return match.group(1) if match else None
+
+
+def _raw_migrated_cookie_snapshot(profile_dir: Path) -> ChromeCookieSnapshot | None:
+    """Detect an OSID cookie without decrypting its value.
+
+    Chrome's newer Windows cookie encryption can prevent browser-cookie3 from
+    reading values even though the browser itself can use them. The encrypted
+    value is never returned or sent; only the presence of a non-empty OSID row
+    scoped to flow.google.com is used, together with the local account metadata.
+    """
+    try:
+        cookies_path = get_cookies_path(profile_dir)
+        uri = f"file:{cookies_path.as_posix()}?mode=ro"
+        with sqlite3.connect(uri, uri=True) as connection:
+            row = connection.execute(
+                "SELECT 1 FROM cookies WHERE host_key IN (?, ?) "
+                "AND name IN (?, ?) AND length(encrypted_value) > 0 LIMIT 1",
+                (
+                    "flow.google.com",
+                    ".flow.google.com",
+                    "OSID",
+                    "__Secure-OSID",
+                ),
+            ).fetchone()
+    except (OSError, sqlite3.Error, FileNotFoundError):
+        return None
+    if row is None:
+        return None
+    return ChromeCookieSnapshot(
+        httpx_cookies={},
+        google_session=False,
+        migrated_session=True,
+        user_email=_profile_account_email(profile_dir),
+    )
 
 
 def _name_value_cookies(cookies: Iterable[object], *, flow_only: bool) -> dict[str, str]:
@@ -131,6 +194,8 @@ def _get_chrome_cookies3(profile_dir: Path) -> ChromeCookieSnapshot:
     return ChromeCookieSnapshot(
         httpx_cookies=_name_value_cookies(cookies, flow_only=True),
         google_session=_has_google_session_cookie(cookies),
+        migrated_session=_has_migrated_flow_session(cookies),
+        user_email=_profile_account_email(profile_dir),
     )
 
 
@@ -180,6 +245,8 @@ async def _get_chrome_cookies_playwright(profile_dir: Path) -> ChromeCookieSnaps
     return ChromeCookieSnapshot(
         httpx_cookies=_name_value_cookies(all_cookies, flow_only=True),
         google_session=_has_google_session_cookie(all_cookies),
+        migrated_session=_has_migrated_flow_session(all_cookies),
+        user_email=_profile_account_email(profile_dir),
     )
 
 
@@ -194,4 +261,8 @@ async def get_chrome_cookie_snapshot(profile_dir: Path) -> ChromeCookieSnapshot:
         return _get_chrome_cookies3(profile_dir=profile_dir)
     except PermissionError:
         logger.info("cookie_decryption_failed_falling_back_to_playwright", profile=str(profile_dir))
+        migrated = _raw_migrated_cookie_snapshot(profile_dir)
+        if migrated is not None:
+            logger.info("migrated_flow_cookie_detected", profile=str(profile_dir))
+            return migrated
         return await _get_chrome_cookies_playwright(profile_dir=profile_dir)

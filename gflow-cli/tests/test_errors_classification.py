@@ -255,12 +255,23 @@ class TestPerInstanceRetryability:
         assert is_retryable(exc_info.value) is False
         assert EXIT_CODE_MAP[FlowAppError] == 31
 
+    def test_the_root_public_landing_raises_the_same_flow_app_error(self) -> None:
+        from gflow_cli.api.transports._common import raise_if_known_landing
+        from gflow_cli.errors import FlowAppError
+
+        page = type("P", (), {"url": "https://flow.google.com/?hl=en"})()
+        with pytest.raises(FlowAppError) as exc_info:
+            raise_if_known_landing(page, requested="project abc", at="test")
+
+        assert "https://flow.google.com/" in str(exc_info.value)
+        assert "project abc" in str(exc_info.value)
+
     def test_a_truthy_non_bool_override_does_not_flip_the_class_answer(self) -> None:
         """`is_retryable` pins the override with `isinstance(..., bool)`, not truthiness.
 
         A `MagicMock` answers every `getattr` with a truthy child mock. Under a
         truthiness test that child would read as "retryable: yes" for any object
-        carrying it, and no assertion in the suite would notice (memory
+        carrying it, and no assertion in the suite would notice (memory:
         `magicmock-truthy-getattr-silences-guards`).
 
         Deliberately a BARE mock, not `spec=FlowAppError`: a spec'd mock satisfies

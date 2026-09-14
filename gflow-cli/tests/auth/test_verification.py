@@ -48,9 +48,18 @@ class TestEvaluateSessionResponse:
         assert status.authenticated is False
         assert status.user_email is None
 
-    def test_empty_session_no_google_cookie(self) -> None:
-        status = evaluate_session_response(200, "{}", google_session=False, source="chrome")
-        assert status.outcome is FlowSessionOutcome.NO_SESSION
+    def test_migrated_flow_session_with_osid_and_profile_email(self) -> None:
+        status = evaluate_session_response(
+            200,
+            "{}",
+            google_session=True,
+            migrated_session=True,
+            migrated_email="migrated.user@example.com",
+            source="chrome",
+        )
+        assert status.outcome is FlowSessionOutcome.AUTHENTICATED
+        assert status.authenticated is True
+        assert status.user_email == "migrated.user@example.com"
 
     def test_null_user_does_not_crash(self) -> None:
         status = evaluate_session_response(

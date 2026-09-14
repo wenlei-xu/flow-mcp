@@ -156,6 +156,8 @@ export default function App() {
   const [projectPool, setProjectPool] = useState([]);
   const [projectCatalog, setProjectCatalog] = useState([]);
   const [projectBusy, setProjectBusy] = useState(false);
+  const [manualProjectId, setManualProjectId] = useState("");
+  const [manualProjectTitle, setManualProjectTitle] = useState("");
   const [config, setConfig] = useState({
     queue_workers: 4,
     image_workers: 8,
@@ -652,6 +654,20 @@ export default function App() {
       notify(`加入项目池失败：${error.message}`);
     }
   }
+  async function addManualProject() {
+    const projectId = manualProjectId.trim();
+    if (!projectManager || !projectId) {
+      notify("请输入 Flow 项目 ID");
+      return;
+    }
+    await addProjectToPool({
+      project_id: projectId,
+      title: manualProjectTitle.trim() || projectId,
+    });
+    setManualProjectId("");
+    setManualProjectTitle("");
+  }
+
   async function createProjectForProfile() {
     if (!projectManager) return;
     const title = window.prompt(
@@ -891,7 +907,9 @@ export default function App() {
                 <div className="account-actions">
                   <Button onClick={() => refreshCredits(item.name)}>刷新额度</Button>
                   <Button onClick={() => relogin(item.name)}>重登</Button>
-                  <Button onClick={() => openProjects(item)}>项目池</Button>
+                  <Button onClick={() => relogin(item.name)}>打开 Chrome</Button>
+                   <Button onClick={() => openProjects(item)}>项目池</Button>
+                   <Button onClick={() => openProjects(item)}>项目池</Button>
                   <Button onClick={() => editProfile(item)}>编辑</Button>
                   <Button
                     onClick={() =>
@@ -947,8 +965,14 @@ export default function App() {
                   <Empty>正在读取 Flow 项目…</Empty>
                 ) : (
                   <>
-                    <div className="project-list">
-                      {projectPool.map((project) => (
+                                         <div className="form-grid project-manual-form">
+                       <label>已有项目 ID <input value={manualProjectId} onChange={(event) => setManualProjectId(event.target.value)} placeholder="例如 6aa3ed09-8eff-486b-9674-b3f2329728c0" /></label>
+                       <label>项目名称（可选） <input value={manualProjectTitle} onChange={(event) => setManualProjectTitle(event.target.value)} placeholder="迁移项目" /></label>
+                       <Button className="primary" onClick={addManualProject}>加入已有项目</Button>
+                     </div>
+
+                                           <div className="project-list">
+                       {projectPool.map((project) => (
                         <div className="project-row" key={project.project_id}>
                           <div>
                             <strong>

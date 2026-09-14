@@ -121,6 +121,8 @@ def evaluate_session_response(
     *,
     google_session: bool,
     source: str,
+    migrated_session: bool = False,
+    migrated_email: str | None = None,
 ) -> FlowSessionStatus:
     """Map a raw /api/auth/session response to a FlowSessionStatus.
 
@@ -149,6 +151,11 @@ def evaluate_session_response(
     parsed_dict = cast("dict[str, Any]", parsed)
     user = parsed_dict.get("user")
     if user is None or user == {}:
+        # Migrated flow.google.com accounts do not expose the legacy NextAuth
+        # user payload; their OSID session is validated from the profile cookie
+        # store and paired with Chrome's local account metadata.
+        if migrated_session and migrated_email:
+            return _result(FlowSessionOutcome.AUTHENTICATED, migrated_email)
         # Authenticated-shaped endpoint reachable, but no Flow session.
         if google_session:
             return _result(FlowSessionOutcome.GOOGLE_SESSION_ONLY)
@@ -224,7 +231,7 @@ async def _fetch_session_httpx(client: Any) -> tuple[int, str]:
 
 async def fetch_flow_session_httpx(
     profile_dir: Path,
-) -> tuple[int, str, bool]:
+) -> tuple[int, str, bool, bool, str | None]:
     """Read a profile's cookies and probe Flow's session endpoint with retries.
 
     The client created here is scoped to ``labs.google`` and is closed before
@@ -236,6 +243,8 @@ async def fetch_flow_session_httpx(
     import httpx
 
     cookie_snapshot = await get_chrome_cookie_snapshot(profile_dir)
+    if cookie_snapshot.migrated_session and cookie_snapshot.user_email:
+        return 200, "{}", False, True, cookie_snapshot.user_email
     async with httpx.AsyncClient(
         cookies=cookie_snapshot.httpx_cookies,
         headers=_SESSION_HEADERS,
@@ -243,7 +252,13 @@ async def fetch_flow_session_httpx(
         timeout=15.0,
     ) as client:
         status_code, body = await _fetch_session_httpx(client)
-    return status_code, body, cookie_snapshot.google_session
+    return (
+        status_code,
+        body,
+        cookie_snapshot.google_session,
+        cookie_snapshot.migrated_session,
+        cookie_snapshot.user_email,
+    )
 
 
 async def verify_flow_session(
@@ -270,6 +285,8 @@ async def verify_flow_session(
     `strict=False` — see the design spec §4.2.
     """
     _validate_profile_in_home(profile_dir)
+    migrated_session = False
+    migrated_email: str | None = None
 
     # Lazy import — a top-level `from .strategies import ...` would create the
     # cycle strategies -> real_chrome -> verification -> strategies.
@@ -316,6 +333,8 @@ async def verify_flow_session(
         status_code,
         body,
         google_session=google_session,
+        migrated_session=migrated_session,
+        migrated_email=migrated_email,
         source=source,
     )
     if result.outcome is FlowSessionOutcome.VERIFICATION_ERROR:
@@ -343,10 +362,16 @@ async def verify_flow_profile(
     """
     _validate_profile_in_home(profile_dir)
 
-    status_code: int
-    body: str
+    migrated_session = False
+    migrated_email: str | None = None
     try:
-        status_code, body, google_session = await fetch_flow_session_httpx(profile_dir)
+        (
+            status_code,
+            body,
+            google_session,
+            migrated_session,
+            migrated_email,
+        ) = await fetch_flow_session_httpx(profile_dir)
 
     # #796: the marker gate is local profile state, not a network fault. It was
     # flattened into VERIFICATION_ERROR, whose remediation says "check network
@@ -375,6 +400,8 @@ async def verify_flow_profile(
         status_code,
         body,
         google_session=google_session,
+        migrated_session=migrated_session,
+        migrated_email=migrated_email,
         source=source,
     )
     if result.outcome is FlowSessionOutcome.VERIFICATION_ERROR:

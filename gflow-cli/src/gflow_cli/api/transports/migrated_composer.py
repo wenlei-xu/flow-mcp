@@ -62,6 +62,7 @@ from gflow_cli.api.video import (
 )
 from gflow_cli.errors import (
     ConfigurationError,
+    FlowAppError,
     FlowHostMigratedError,
     InsufficientCreditsError,
     MediaUploadRejectedError,
@@ -654,6 +655,21 @@ class MigratedComposer:
 
     # --- readiness ------------------------------------------------------------
 
+    @staticmethod
+    def _assert_requested_project(page: Page, project_id: str) -> None:
+        """Refuse to generate when Flow restored a different project."""
+        actual = extract_project_id(str(getattr(page, "url", "") or ""))
+        if actual is not None and actual.casefold() == project_id.casefold():
+            return
+        raise FlowAppError(
+            detail=(
+                f"Flow opened project {actual or '(none)'} instead of requested "
+                f"project {project_id}. The editor belongs to a different project "
+                "or Flow did not finish the requested navigation; no generation was submitted."
+            ),
+            retryable=False,
+        )
+
     async def ensure_editor(self, page: Page, project_id: str, *, timeout_s: float = 30.0) -> None:
         """Land on ``flow.google.com/project/<id>`` (direct — no labs.google visit
         needed on either kind of account) and wait for the settings trigger."""
@@ -734,6 +750,10 @@ class MigratedComposer:
                         f"is off, so this is ordinary selector drift: {e2}"
                     )
                 raise UiSelectorDriftError(detail=detail) from e2
+        # The editor can render after Flow restores a different project than the one
+        # requested by the caller. Do not let a healthy-looking composer spend credits
+        # in that project.
+        self._assert_requested_project(page, project_id)
         # One count() on the happy path, for the cohort that would render the agent prompt
         # box while LEAVING the trigger visible: `send_prompt` would type into the agent
         # composer ([contenteditable='true'].first) and nothing downstream would notice.
@@ -964,6 +984,10 @@ class MigratedComposer:
                 log.info("migrated.i2v_model_defaulted", model=model.value, issue_ref="#125")
             if model is not None:
                 await self._select_model(page, pane, model)
+                # Flow re-renders model-dependent option groups asynchronously. The
+                # duration row can be absent for the first frame after the model menu
+                # closes, even when this account/model supports it.
+                await asyncio.sleep(0.8)
             await self._select(page, pane, axis="aspect", lig=ASPECT_LIGATURE[request.aspect])
             if request.duration is not None:
                 if request.mode is Mode.R2V and request.duration != R2V_DURATION_S:

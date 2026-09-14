@@ -31,6 +31,7 @@ from gflow_cli.api.video import Aspect, GenerateVideoRequest, Mode, VideoModel
 from gflow_cli.errors import (
     EXIT_CODE_MAP,
     ConfigurationError,
+    FlowAppError,
     FlowHostMigratedError,
     InsufficientCreditsError,
     MediaUploadRejectedError,
@@ -1552,12 +1553,23 @@ async def test_ensure_editor_navigates_direct_when_not_on_the_project() -> None:
     assert page.gotos == ["https://flow.google.com/project/p1"]
 
 
-async def test_ensure_editor_skips_navigation_when_already_there() -> None:
-    from gflow_cli.api.transports.migrated_composer import MigratedComposer
+async def test_ensure_editor_rejects_a_different_project_after_navigation() -> None:
+    page = FakePage(url="https://flow.google.com/project/old")
 
-    page = FakePage(url="https://flow.google.com/project/p1")
-    await MigratedComposer().ensure_editor(page, "p1", timeout_s=1.0)
-    assert page.gotos == []
+    async def goto_wrong_project(url: str, **_: Any) -> None:
+        page.gotos.append(url)
+        page.url = "https://flow.google.com/project/other"
+
+    page.goto = goto_wrong_project
+    with pytest.raises(FlowAppError, match="other.*p1|p1.*other") as exc:
+        await migrated_composer.MigratedComposer().ensure_editor(page, "p1", timeout_s=1.0)
+    assert exc.value.retryable is False
+
+
+async def test_ensure_editor_accepts_the_requested_project_after_navigation() -> None:
+    page = FakePage(url="https://flow.google.com/project/old")
+    await migrated_composer.MigratedComposer().ensure_editor(page, "p1", timeout_s=1.0)
+    assert page.url == "https://flow.google.com/project/p1"
 
 
 async def test_ensure_editor_exits_persisted_agent_mode_before_waiting_for_settings() -> None:

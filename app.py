@@ -1136,6 +1136,12 @@ class GenerationRequest(BaseModel):
     idempotency_key: str | None = Field(default=None, max_length=200)
 
 
+def _normalize_generation_request(request: GenerationRequest) -> GenerationRequest:
+    if request.kind == "video" and request.aspect != "9:16":
+        return request.model_copy(update={"aspect": "9:16"})
+    return request
+
+
 class ProfileCreateRequest(BaseModel):
     name: str
     remark: str = Field(default="", max_length=200)
@@ -1681,16 +1687,23 @@ def _absolute_media_url(value: str | None, request: Request | None = None) -> st
     return value
 
 
+def _video_content_signature(task_id: str, exp: int) -> str:
+    return hmac.new(MEDIA_SIGNING_SECRET.encode("utf-8"), f"video:{task_id}:{exp}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _video_content_url(task_id: str, request: Request | None = None) -> str:
+    exp = int(time.time()) + MEDIA_URL_TTL_SECONDS
+    sig = _video_content_signature(task_id, exp)
+    path = f"/v1/videos/{task_id}/content?exp={exp}&sig={sig}"
+    return _absolute_media_url(path, request) or path
+
+
 def _openai_video_response(task: dict[str, Any], request: Request | None = None) -> dict[str, Any]:
     public = _public_task(task)
     result = public.get("result") if isinstance(public.get("result"), dict) else {}
     files = result.get("files", []) if isinstance(result, dict) else []
-    data = [
-        {"url": _absolute_media_url(item.get("preview_url"), request), "mime_type": "video/mp4"}
-        for item in files
-        if isinstance(item, dict) and item.get("preview_url")
-    ]
-    video_url = data[0]["url"] if data else None
+    video_url = _video_content_url(str(task["id"]), request) if files else None
+    data = [{"url": video_url, "mime_type": "video/mp4"}] if video_url else []
     response = {
         "id": task["id"],
         "object": "video.generation",
@@ -1899,9 +1912,21 @@ async def _openai_generation_lookup(task_id: str, request: Request) -> dict[str,
 
 
 @app.get("/v1/videos/{task_id}/content")
-async def openai_video_content(task_id: str, request: Request) -> Response:
-    """Serve a completed video for clients that use the OpenAI content path."""
-    _check_gateway_auth(request)
+async def openai_video_content(
+    task_id: str,
+    request: Request,
+    exp: int | None = Query(default=None),
+    sig: str | None = Query(default=None),
+) -> Response:
+    """Serve a completed video for OpenAI clients and signed Canvas URLs."""
+    signed = (
+        exp is not None
+        and exp >= int(time.time())
+        and sig is not None
+        and hmac.compare_digest(sig, _video_content_signature(task_id, exp))
+    )
+    if not signed:
+        _check_gateway_auth(request)
     task = _load_task(task_id)
     if task is None or task.get("kind") != "video":
         raise HTTPException(status_code=404, detail="视频任务不存在")
@@ -3099,6 +3124,7 @@ async def _execute_generation(task_id: str, request: GenerationRequest) -> None:
 
 @app.post("/api/generations", status_code=202)
 async def create_generation(request: GenerationRequest) -> dict[str, Any]:
+    request = _normalize_generation_request(request)
     if request.input_asset_ids:
         request = request.model_copy(update={"reference_images": [*request.reference_images, *_resolve_input_asset_ids(request.input_asset_ids)]})
     if request.kind == "video" and _veo_model_has_no_duration_control(request.model) and request.duration is not None:

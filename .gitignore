@@ -10,3 +10,4 @@ tmp/
 __pycache__/
 .pytest_cache/
 *.log
+.studio-secrets.ps1

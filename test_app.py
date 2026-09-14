@@ -36,7 +36,13 @@ class StudioSmokeTests(unittest.TestCase):
             # loop closes; the OS reclaims this temporary directory later.
             pass
 
-    def test_signed_media_url_is_time_limited(self):
+    def test_video_requests_force_portrait_aspect(self):
+        video = studio.GenerationRequest(kind="video", prompt="video", aspect="1:1")
+        image = studio.GenerationRequest(kind="image", prompt="image", aspect="1:1")
+
+        self.assertEqual(studio._normalize_generation_request(video).aspect, "9:16")
+        self.assertEqual(studio._normalize_generation_request(image).aspect, "1:1")
+
         asset = studio.UPLOAD_DIR / "asset.png"
         asset.write_bytes(b"png")
         with patch.object(studio, "_is_loopback", return_value=True), TestClient(studio.app) as client:
@@ -250,7 +256,23 @@ class StudioSmokeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.content, b"fake-mp4")
 
-    def test_openai_responses_facade_preserves_async_task_shape(self):
+    def test_openai_video_response_uses_api_content_route(self):
+        video = studio.UPLOAD_DIR / "video-result.mp4"
+        video.write_bytes(b"fake-mp4")
+        task = {
+            "id": "video-task",
+            "status": "succeeded",
+            "created_at": datetime.now(UTC).isoformat(),
+            "result": {"files": [{"path": str(video)}]},
+        }
+
+        response = studio._openai_video_response(task)
+
+        self.assertTrue(response["url"].startswith("/v1/videos/video-task/content?exp="))
+        self.assertIn("&sig=", response["url"])
+        self.assertEqual(response["video_url"], response["url"])
+        self.assertEqual(response["content"]["url"], response["url"])
+
         captured = {}
 
         async def fake_create_generation(request):
