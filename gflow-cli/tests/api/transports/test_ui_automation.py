@@ -567,7 +567,7 @@ class TestEnterEditor:
         await t._enter_editor(page)  # type: ignore[attr-defined]
         # Gallery navigation happened, then "+ New project" flow ran.
         page.goto.assert_awaited_once()
-        assert "tools/flow" in page.goto.call_args.args[0]
+        assert page.goto.call_args.args[0] == "https://flow.google.com/"
         page.wait_for_timeout.assert_called()
         page.locator.assert_called()
 

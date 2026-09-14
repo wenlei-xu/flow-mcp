@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 _console = Console()
 
-GEMINI_URL = "https://labs.google/fx/tools/flow?hl=en"
+GEMINI_URL = "https://flow.google.com/"
 
 # User-facing guidance per non-authenticated verification outcome (issue #15).
 _UNVERIFIED_MESSAGE: dict[FlowSessionOutcome, str] = {

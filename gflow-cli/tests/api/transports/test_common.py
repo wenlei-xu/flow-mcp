@@ -75,7 +75,7 @@ def _resp(status: int, body: object) -> MagicMock:
 
 
 def test_constants_are_canonical() -> None:
-    assert FLOW_URL == "https://labs.google/fx/tools/flow?hl=en"
+    assert FLOW_URL == "https://flow.google.com/"
     assert PER_CALL_TIMEOUT_S == 30
     assert BEARER_DEFAULT_TTL_S == 3600
     assert REFRESH_SAFETY_MARGIN_S == 60

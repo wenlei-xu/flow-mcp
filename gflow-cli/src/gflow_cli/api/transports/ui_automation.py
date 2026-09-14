@@ -87,8 +87,9 @@ log = structlog.get_logger(__name__)
 _JsonObj = dict[str, Any]
 _AnyList = list[Any]
 
-# Flow editor entrypoint — ``?hl=en`` locks locale for selector stability.
-FLOW_URL = "https://labs.google/fx/tools/flow?hl=en"
+# Flow editor entrypoint. The current Flow frontend is hosted directly on
+# flow.google.com; do not bootstrap through the retired labs.google landing page.
+FLOW_URL = "https://flow.google.com/"
 # URL fragment that distinguishes the project editor from the gallery.
 _PROJECT_URL_FRAGMENT = "/project/"
 
@@ -99,8 +100,8 @@ _PROJECT_URL_FRAGMENT = "/project/"
 # localise across locales — the has-text() entries are therefore locale-stable.
 # Primary locale control is ``locale=locale_env`` in launch_persistent_context
 # (Playwright kwarg — persists across all in-session navigations including
-# /project/<uuid> deep-links that drop the ?hl= param).  FLOW_URL's ``?hl=en``
-# reinforces English on the initial load.  'Nano Banana 2' is not a substring of
+# /project/<uuid> deep-links). The browser context still supplies the configured
+# locale on every navigation. 'Nano Banana 2' is not a substring of
 # 'Nano Banana Pro', so has-text is unambiguous across the three.
 # Tier 1 (structural) slots are reserved for data-* / aria-* anchors once a DOM
 # probe via scripts/dev/capture_locale_invariants.py confirms stable attributes.

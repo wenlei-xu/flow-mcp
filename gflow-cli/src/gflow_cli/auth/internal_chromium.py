@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 _console = Console()
 
-GEMINI_URL = "https://labs.google/fx/tools/flow?hl=en"
+GEMINI_URL = "https://flow.google.com/"
 GOOGLE_REJECTED_BROWSER_ROUTE = "accounts.google.com/v3/signin/rejected"
 POLL_INTERVAL_SECONDS = 3
 

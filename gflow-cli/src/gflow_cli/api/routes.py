@@ -82,16 +82,13 @@ def batch_generate_images_url(project_id: str) -> str:
     return f"{FLOW_API_BASE}/projects/{project_id}/flowMedia:batchGenerateImages"
 
 
-# Bootstrap URL — the Flow editor page. The persistent context navigates here
-# once before making API calls so Google's cookies + reCAPTCHA JS are loaded.
+# Bootstrap URL — the current Flow editor page. The persistent context navigates
+# here once before making API calls so Google's cookies + reCAPTCHA JS are loaded.
 #
-# NOTE (#580): `?hl=en` does NOT pin the rendered locale, despite what this
-# comment used to claim. Measured on a pt-BR account: the document still renders
-# `lang=pt` and Flow still redirects the path to `/fx/pt/...`. Selector stability
-# rests entirely on the locale-invariant selector tiers (icon ligatures, ARIA
-# roles) — not on this parameter. Do not rely on it for locale control.
-# That redirect is also what the client reads to learn the ACCOUNT's locale.
-EDITOR_BOOTSTRAP_URL = "https://labs.google/fx/tools/flow?hl=en"
+# The migrated root intentionally has no locale path. The client reads the
+# account locale from the hydrated document (and uses locale-invariant selectors
+# for the editor), so the old labs.google `?hl=en` bootstrap is not needed.
+EDITOR_BOOTSTRAP_URL = "https://flow.google.com/"
 
 # Character entities (tRPC + aisandbox Bearer REST) ------------------------
 CREATE_ENTITY_URL = f"{LABS_TRPC_BASE}/flow.createEntity"

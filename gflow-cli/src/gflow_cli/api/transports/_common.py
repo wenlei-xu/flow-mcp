@@ -41,7 +41,7 @@ from gflow_cli.errors import (
 
 log = structlog.get_logger(__name__)
 
-FLOW_URL: str = "https://labs.google/fx/tools/flow?hl=en"
+FLOW_URL: str = "https://flow.google.com/"
 PER_CALL_TIMEOUT_S: int = 30
 BEARER_DEFAULT_TTL_S: int = 3600
 REFRESH_SAFETY_MARGIN_S: int = 60
