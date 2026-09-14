@@ -9,8 +9,8 @@ const queryClient = new QueryClient({
     queries: {
       staleTime: 5000,
       retry: 1,
-      refetchOnWindowFocus: true,
-      refetchOnReconnect: true,
+      refetchOnWindowFocus: false,
+      refetchOnReconnect: false,
     },
   },
 });

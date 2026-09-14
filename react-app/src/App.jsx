@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 const NAV = [
   ["overview", "◌", "概览"],
@@ -88,6 +88,7 @@ function Button({ children, className = "", ...props }) {
 }
 
 export default function App() {
+  const queryClient = useQueryClient();
   const [view, setView] = useState("overview");
   const [live, setLive] = useState(false);
   const [healthError, setHealthError] = useState("");
@@ -148,30 +149,22 @@ export default function App() {
   const authQuery = useQuery({
     queryKey: ["studio", "auth"],
     queryFn: () => api("/api/auth/status"),
-    refetchInterval: 8000,
-    refetchIntervalInBackground: false,
   });
   const authenticatedQuery = !authQuery.data?.required || Boolean(authQuery.data?.authenticated);
   const profilesQuery = useQuery({
     queryKey: ["studio", "profiles"],
     queryFn: () => api("/api/profiles"),
     enabled: authenticatedQuery,
-    refetchInterval: 8000,
-    refetchIntervalInBackground: false,
   });
   const statsQuery = useQuery({
     queryKey: ["studio", "stats"],
     queryFn: () => api("/api/stats"),
     enabled: authenticatedQuery,
-    refetchInterval: 8000,
-    refetchIntervalInBackground: false,
   });
   const logsQuery = useQuery({
     queryKey: ["studio", "logs"],
     queryFn: () => api("/api/logs?limit=100"),
     enabled: authenticatedQuery,
-    refetchInterval: 8000,
-    refetchIntervalInBackground: false,
   });
   const modelsQuery = useQuery({
     queryKey: ["studio", "models"],
@@ -188,8 +181,6 @@ export default function App() {
   const healthQuery = useQuery({
     queryKey: ["studio", "health"],
     queryFn: () => api("/api/health"),
-    refetchInterval: 8000,
-    refetchIntervalInBackground: false,
   });
   const fileRef = useRef(null);
   const toastTimer = useRef(null);
@@ -668,6 +659,10 @@ export default function App() {
   }
 
   function topbar() {
+    function refreshAll() {
+      void queryClient.invalidateQueries({ queryKey: ["studio"] });
+      notify("数据已刷新");
+    }
     return (
       <header className="topbar">
         <div className="crumb">
@@ -682,6 +677,9 @@ export default function App() {
             账号池 · {stats.available_profiles ?? activeProfiles.length} 可用 /{" "}
             {stats.busy_profiles ?? 0} 忙碌
           </span>
+          <Button className="ghost refresh-button" onClick={refreshAll} title="刷新工作台数据">
+            ↻ 刷新
+          </Button>
           <div className="avatar">AP</div>
         </div>
       </header>

@@ -1536,7 +1536,12 @@ def _rewrite_mcp_payload(body: bytes, content_type: str = "") -> bytes:
 
 @app.get("/")
 async def index() -> FileResponse:
-    entry = DIST_DIR / "index.html" if (DIST_DIR / "index.html").is_file() else HERE / "index.html"
+    entry = DIST_DIR / "index.html"
+    if not entry.is_file():
+        raise HTTPException(
+            status_code=503,
+            detail="React 前端构建产物不存在，请先运行 npm install && npm run build",
+        )
     return FileResponse(entry)
 
 
